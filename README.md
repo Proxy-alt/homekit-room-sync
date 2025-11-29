@@ -206,6 +206,70 @@ poetry run ruff check .
 poetry run mypy custom_components/homekit_room_sync
 ```
 
+### Local Deployment via SSH
+
+For quick development iteration, you can deploy directly to your Home Assistant server using the included deploy script.
+
+#### Quick Start
+
+```bash
+# Deploy to a specific host
+make deploy HOST=192.168.1.100
+
+# Or use the script directly
+./scripts/deploy.sh homeassistant.local
+```
+
+#### Using Environment Variables
+
+Create a `.env` file for persistent configuration:
+
+```bash
+# Copy the example file
+cp env.example .env
+
+# Edit with your settings
+nano .env
+```
+
+Example `.env` configuration:
+
+```bash
+HA_HOST=192.168.1.100
+HA_USER=root
+HA_SSH_PORT=22
+HA_CONFIG_PATH=/config
+HA_RESTART=false
+```
+
+Then simply run:
+
+```bash
+make deploy
+```
+
+#### Deploy Script Options
+
+```bash
+./scripts/deploy.sh [OPTIONS] [HOST]
+
+Options:
+  -h, --help          Show help message
+  -u, --user USER     SSH user (default: root)
+  -p, --port PORT     SSH port (default: 22)
+  -c, --config PATH   HA config directory (default: /config)
+  -r, --restart       Restart Home Assistant after deployment
+  --dry-run           Show what would be done without executing
+```
+
+#### Common Configuration Paths
+
+| Installation Type | Config Path |
+|-------------------|-------------|
+| HAOS / Docker | `/config` |
+| Supervised | `/usr/share/hassio/homeassistant` |
+| Core (venv) | `/home/homeassistant/.homeassistant` |
+
 ### Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
