@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13.3"
 
       - name: Install Poetry
         uses: snok/install-poetry@v1
@@ -38,6 +38,9 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
 
+      - name: Ensure Poetry uses correct Python
+        run: poetry env use python
+
       - name: Install dependencies
         if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
         run: poetry install --no-interaction --no-root
@@ -50,6 +53,9 @@ jobs:
 
       - name: Run Ruff formatter check
         run: poetry run ruff format --check custom_components/
+
+      - name: Run tests
+        run: poetry run pytest -q
 
   validate:
     name: Validate Integration

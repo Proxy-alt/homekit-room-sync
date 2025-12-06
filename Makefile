@@ -1,4 +1,4 @@
-.PHONY: help install lint format typecheck check clean dev test
+.PHONY: help install lint format typecheck check clean dev test deploy
 
 # Default target
 help:
@@ -18,6 +18,11 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  test        Run pytest"
+	@echo ""
+	@echo "Deployment:"
+	@echo "  deploy           Deploy to HA server (uses .env or HA_HOST env var)"
+	@echo "  deploy HOST=x    Deploy to specific host"
+	@echo "  deploy ARGS='--dry-run --restart host'  Pass args to deploy.sh"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  clean       Remove build artifacts and caches"
@@ -92,4 +97,12 @@ bump-major:
 	jq ".version = \"$$new\"" custom_components/homekit_room_sync/manifest.json > tmp.json && mv tmp.json custom_components/homekit_room_sync/manifest.json; \
 	sed -i.bak "s/version = \"$$current\"/version = \"$$new\"/" pyproject.toml && rm -f pyproject.toml.bak; \
 	echo "Bumped version: $$current -> $$new"
+
+# Deploy to Home Assistant server
+# Usage:
+#   make deploy
+#   make deploy HOST=192.168.1.100
+#   make deploy ARGS="--dry-run --restart 192.168.1.100"
+deploy:
+	./scripts/deploy.sh $(ARGS) $(HOST)
 

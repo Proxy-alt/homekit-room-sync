@@ -100,15 +100,6 @@ git checkout -b fix/your-bug-fix
 3. **Test your changes** in a Home Assistant environment if possible
 
 4. **Commit your changes** with a clear message:
-
-```bash
-git commit -m "feat: add support for multiple default rooms"
-# or
-git commit -m "fix: handle missing area gracefully"
-```
-
-5. **Push and create a pull request**:
-
 ```bash
 git push origin feature/your-feature-name
 ```

@@ -38,6 +38,36 @@ jobs:
             echo "Tag v${{ steps.version.outputs.version }} does not exist"
           fi
 
+      - name: Sync pyproject version
+        if: steps.tag_check.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY'
+from pathlib import Path
+import re
+version = "${VERSION}"
+path = Path("pyproject.toml")
+text = path.read_text()
+pattern = re.compile(r'(?m)^version\s*=\s*"[^"]+"')
+replacement = f'version = "{version}"'
+if not pattern.search(text):
+    raise SystemExit("version field not found in pyproject.toml")
+new_text = pattern.sub(replacement, text, count=1)
+if new_text != text:
+    path.write_text(new_text)
+PY
+
+          if git status --porcelain pyproject.toml | grep -q pyproject.toml; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add pyproject.toml
+            git commit -m "chore: bump pyproject version to ${VERSION} [skip ci]"
+            git push
+          else
+            echo "pyproject.toml already at ${VERSION}"
+          fi
+
       - name: Generate changelog
         id: changelog
         if: steps.tag_check.outputs.exists == 'false'
