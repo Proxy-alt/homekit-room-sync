@@ -84,6 +84,7 @@ class HomeKitBridgeManager:
         self._hass = hass
         self._entry = entry
         self._configs = {cfg.entry_id: cfg for cfg in bridge_configs}
+        self._sync_lock = asyncio.Lock()
 
     @property
     def bridge_ids(self) -> list[str]:
@@ -92,6 +93,10 @@ class HomeKitBridgeManager:
 
     async def async_sync(self, bridge_entry_id: str | None = None) -> bool:
         """Recompute filters for one or all bridges."""
+        async with self._sync_lock:
+            return await self._async_sync_unlocked(bridge_entry_id)
+
+    async def _async_sync_unlocked(self, bridge_entry_id: str | None) -> bool:
         if bridge_entry_id and bridge_entry_id not in self._configs:
             _LOGGER.warning(
                 "Sync requested for unknown HomeKit entry_id %s",
