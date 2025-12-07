@@ -193,8 +193,8 @@ class HomeKitBridgeManager:
 
         entities: set[str] = set()
         if not config.areas:
-            # Legacy behavior: empty selection means include every entity the bridge exposes.
-            return {entry.entity_id for entry in entries.values()}
+            # Do not include anything when no areas are selected; only manual includes apply.
+            return set()
 
         for entry in entries.values():
             area_id = entry.area_id or self._device_area_id(dev_reg, entry.device_id)
