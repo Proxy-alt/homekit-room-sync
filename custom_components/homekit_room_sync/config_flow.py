@@ -16,17 +16,14 @@ from homeassistant.core import callback
 from homeassistant.helpers import area_registry, config_validation as cv
 
 from .const import (
-    CONF_ALLOWED_AREAS,
-    CONF_BRIDGE_ID,
-    CONF_BRIDGE_NAME,
-    CONF_BRIDGE_TITLE,
-    CONF_DEFAULT_ROOM,
+    CONF_AREAS,
+    CONF_BRIDGES,
+    CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
-    CONF_MANAGED_BRIDGES,
     DOMAIN,
+    HOMEKIT_DOMAIN,
 )
-from .storage import async_discover_bridges
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,9 +50,8 @@ class BridgeFlowMixin:
 
     def __init__(self) -> None:
         self._area_options: dict[str, str] | None = None
-        self._area_name_lookup: dict[str, str] = {}
         self._area_id_lookup: dict[str, str] = {}
-        self._discovered_bridges: dict[str, str] = {}
+        self._homekit_titles: dict[str, str] = {}
         self._selected_bridge_ids: list[str] = []
         self._bridge_form_index = 0
         self._bridge_payloads: list[dict[str, Any]] = []
@@ -67,7 +63,6 @@ class BridgeFlowMixin:
 
         registry = area_registry.async_get(self.hass)
         options: dict[str, str] = {}
-        name_lookup: dict[str, str] = {}
         id_lookup: dict[str, str] = {}
 
         for area in sorted(
@@ -79,11 +74,9 @@ class BridgeFlowMixin:
                 continue
             label = area.name or key
             options[key] = label
-            name_lookup[key] = label
             id_lookup[key] = area.id or key
 
         self._area_options = options
-        self._area_name_lookup = name_lookup
         self._area_id_lookup = id_lookup
 
     def _area_key_for_id(self, area_id: str) -> str | None:
@@ -96,7 +89,7 @@ class BridgeFlowMixin:
         area_options = dict(self._area_options or {})
 
         allowed_defaults: list[str] = []
-        for area_id in defaults.get(CONF_ALLOWED_AREAS, []):
+        for area_id in defaults.get(CONF_AREAS, []):
             key = self._area_key_for_id(area_id)
             if key is None:
                 area_options[area_id] = area_id
@@ -104,34 +97,15 @@ class BridgeFlowMixin:
                 key = area_id
             allowed_defaults.append(key)
 
-        room_options = {"": "(No default room)"}
-        room_options.update(area_options)
-
-        default_room_name = defaults.get(CONF_DEFAULT_ROOM)
-        default_room_key = ""
-        if default_room_name:
-            for key, name in self._area_name_lookup.items():
-                if name == default_room_name:
-                    default_room_key = key
-                    break
-            else:
-                room_options[default_room_name] = default_room_name
-                self._area_name_lookup[default_room_name] = default_room_name
-                default_room_key = default_room_name
-
         include_defaults = _list_to_text(defaults.get(CONF_INCLUDE_ENTITIES, []))
         exclude_defaults = _list_to_text(defaults.get(CONF_EXCLUDE_ENTITIES, []))
 
         return vol.Schema(
             {
                 vol.Optional(
-                    CONF_ALLOWED_AREAS,
+                    CONF_AREAS,
                     default=allowed_defaults,
                 ): cv.multi_select(area_options),
-                vol.Optional(
-                    CONF_DEFAULT_ROOM,
-                    default=default_room_key,
-                ): vol.In(room_options),
                 vol.Optional(
                     CONF_INCLUDE_ENTITIES,
                     default=include_defaults,
@@ -146,10 +120,9 @@ class BridgeFlowMixin:
     def _serialize_bridge_input(
         self,
         bridge_id: str,
-        friendly_name: str,
         user_input: dict[str, Any],
     ) -> dict[str, Any]:
-        allowed_keys = user_input.get(CONF_ALLOWED_AREAS) or []
+        allowed_keys = user_input.get(CONF_AREAS) or []
         allowed_ids = sorted(
             {
                 self._area_id_lookup.get(key, key)
@@ -157,15 +130,6 @@ class BridgeFlowMixin:
                 if key
             }
         )
-
-        default_room_key = user_input.get(CONF_DEFAULT_ROOM) or ""
-        default_room = (
-            self._area_name_lookup.get(default_room_key)
-            if default_room_key
-            else None
-        )
-        if default_room is None and default_room_key:
-            default_room = default_room_key
 
         include_entities = _parse_entity_text(user_input.get(CONF_INCLUDE_ENTITIES))
         include_set = set(include_entities)
@@ -176,10 +140,8 @@ class BridgeFlowMixin:
         ]
 
         return {
-            CONF_BRIDGE_ID: bridge_id,
-            CONF_BRIDGE_TITLE: friendly_name,
-            CONF_ALLOWED_AREAS: allowed_ids,
-            CONF_DEFAULT_ROOM: default_room,
+            CONF_ENTRY_ID: bridge_id,
+            CONF_AREAS: allowed_ids,
             CONF_INCLUDE_ENTITIES: include_entities,
             CONF_EXCLUDE_ENTITIES: exclude_entities,
         }
@@ -195,11 +157,11 @@ class BridgeFlowMixin:
         await self._ensure_area_data()
 
         bridge_id = self._selected_bridge_ids[self._bridge_form_index]
-        friendly_name = self._discovered_bridges.get(bridge_id, bridge_id)
+        friendly_name = self._homekit_titles.get(bridge_id, bridge_id)
         defaults = self._existing_bridge_map.get(bridge_id, {})
 
         if user_input is not None:
-            payload = self._serialize_bridge_input(bridge_id, friendly_name, user_input)
+            payload = self._serialize_bridge_input(bridge_id, user_input)
             self._bridge_payloads.append(payload)
             self._bridge_form_index += 1
 
@@ -228,7 +190,7 @@ class HomeKitRoomSyncConfigFlow(
 ):  # type: ignore[call-arg]
     """Handle a config flow for HomeKit Room Sync."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self) -> None:
         ConfigFlow.__init__(self)
@@ -239,42 +201,50 @@ class HomeKitRoomSyncConfigFlow(
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         return HomeKitRoomSyncOptionsFlow(config_entry)
 
+    def _discover_homekit_bridges(self) -> dict[str, str]:
+        entries = self.hass.config_entries.async_entries(HOMEKIT_DOMAIN)
+        return {
+            entry.entry_id: entry.title
+            or entry.data.get("name")
+            or entry.entry_id
+            for entry in entries
+        }
+
     async def async_step_user(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
 
-        discovered = await async_discover_bridges(self.hass)
+        discovered = self._discover_homekit_bridges()
         if not discovered:
             return self.async_abort(reason="no_bridges")
 
         configured = {
-            managed.get(CONF_BRIDGE_ID)
+            managed.get(CONF_ENTRY_ID)
             for entry in self._async_current_entries()
-            for managed in entry.data.get(CONF_MANAGED_BRIDGES, [])
+            for managed in entry.data.get(CONF_BRIDGES, [])
             if isinstance(managed, dict)
+            and isinstance(managed.get(CONF_ENTRY_ID), str)
         }
-        for entry in self._async_current_entries():
-            legacy_bridge = entry.data.get(CONF_BRIDGE_NAME)
-            if isinstance(legacy_bridge, str):
-                configured.add(legacy_bridge)
 
         available = {
-            bridge_id: name
-            for bridge_id, name in discovered.items()
-            if bridge_id not in configured
+            entry_id: name
+            for entry_id, name in discovered.items()
+            if entry_id not in configured
         }
 
         if not available:
             return self.async_abort(reason="all_bridges_configured")
 
         if user_input is not None:
-            selected = user_input.get(CONF_MANAGED_BRIDGES, [])
+            selected = user_input.get(CONF_BRIDGES, [])
             if not selected:
                 errors["base"] = "select_bridge"
+            elif any(entry_id not in available for entry_id in selected):
+                errors["base"] = "invalid_bridge"
             else:
-                self._discovered_bridges = available
+                self._homekit_titles = discovered
                 self._selected_bridge_ids = selected
                 self._bridge_payloads = []
                 self._bridge_form_index = 0
@@ -283,7 +253,7 @@ class HomeKitRoomSyncConfigFlow(
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_MANAGED_BRIDGES): cv.multi_select(available),
+                vol.Required(CONF_BRIDGES): cv.multi_select(available),
             }
         )
         return self.async_show_form(
@@ -305,14 +275,15 @@ class HomeKitRoomSyncConfigFlow(
         if not self._bridge_payloads:
             return self.async_abort(reason="no_bridges")
 
-        if len(self._bridge_payloads) == 1:
-            title = f"HomeKit Bridge: {self._bridge_payloads[0][CONF_BRIDGE_TITLE]}"
-        else:
-            title = f"HomeKit Room Sync ({len(self._bridge_payloads)} bridges)"
+        title = (
+            f"HomeKit Bridge: {self._homekit_titles.get(self._bridge_payloads[0][CONF_ENTRY_ID], self._bridge_payloads[0][CONF_ENTRY_ID])}"
+            if len(self._bridge_payloads) == 1
+            else f"HomeKit Room Sync ({len(self._bridge_payloads)} bridges)"
+        )
 
         return self.async_create_entry(
             title=title,
-            data={CONF_MANAGED_BRIDGES: self._bridge_payloads},
+            data={CONF_BRIDGES: self._bridge_payloads},
         )
 
 
@@ -323,22 +294,31 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
         self._config_entry = config_entry
         BridgeFlowMixin.__init__(self)
 
+    def _discover_homekit_bridges(self) -> dict[str, str]:
+        entries = self.hass.config_entries.async_entries(HOMEKIT_DOMAIN)
+        return {
+            entry.entry_id: entry.title
+            or entry.data.get("name")
+            or entry.entry_id
+            for entry in entries
+        }
+
     async def async_step_init(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
 
-        discovered = await async_discover_bridges(self.hass)
+        discovered = self._discover_homekit_bridges()
         current_configs = [
             managed
-            for managed in self.config_entry.data.get(CONF_MANAGED_BRIDGES, [])
+            for managed in self.config_entry.data.get(CONF_BRIDGES, [])
             if isinstance(managed, dict)
         ]
         current_ids = [
-            managed.get(CONF_BRIDGE_ID)
+            managed.get(CONF_ENTRY_ID)
             for managed in current_configs
-            if isinstance(managed.get(CONF_BRIDGE_ID), str)
+            if isinstance(managed.get(CONF_ENTRY_ID), str)
         ]
 
         other_entries = [
@@ -347,48 +327,42 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
             if entry.entry_id != self.config_entry.entry_id
         ]
         reserved_ids = {
-            managed.get(CONF_BRIDGE_ID)
+            managed.get(CONF_ENTRY_ID)
             for entry in other_entries
-            for managed in entry.data.get(CONF_MANAGED_BRIDGES, [])
+            for managed in entry.data.get(CONF_BRIDGES, [])
             if isinstance(managed, dict)
         }
 
         available = {
-            bridge_id: name
-            for bridge_id, name in discovered.items()
-            if bridge_id not in reserved_ids or bridge_id in current_ids
+            entry_id: discovered.get(entry_id, entry_id)
+            for entry_id in discovered
+            if entry_id not in reserved_ids or entry_id in current_ids
         }
 
-        # Ensure currently configured bridges remain selectable even if missing
-        for bridge_id in current_ids:
-            if bridge_id and bridge_id not in available:
-                available[bridge_id] = next(
-                    (
-                        cfg.get(CONF_BRIDGE_TITLE)
-                        for cfg in current_configs
-                        if cfg.get(CONF_BRIDGE_ID) == bridge_id
-                    ),
-                    bridge_id,
-                )
+        for entry_id in current_ids:
+            if entry_id not in available:
+                available[entry_id] = discovered.get(entry_id, entry_id)
 
         if user_input is not None:
-            selected = user_input.get(CONF_MANAGED_BRIDGES, [])
+            selected = user_input.get(CONF_BRIDGES, [])
             if not selected:
                 errors["base"] = "select_bridge"
+            elif any(entry_id not in available for entry_id in selected):
+                errors["base"] = "invalid_bridge"
             else:
-                self._discovered_bridges = available
+                self._homekit_titles = {**discovered, **available}
                 self._selected_bridge_ids = selected
                 self._bridge_payloads = []
                 self._bridge_form_index = 0
                 self._existing_bridge_map = {
-                    cfg.get(CONF_BRIDGE_ID): cfg for cfg in current_configs
+                    cfg.get(CONF_ENTRY_ID): cfg for cfg in current_configs
                 }
                 return await self.async_step_bridge()
 
         schema = vol.Schema(
             {
                 vol.Required(
-                    CONF_MANAGED_BRIDGES,
+                    CONF_BRIDGES,
                     default=current_ids,
                 ): cv.multi_select(available),
             }
@@ -411,7 +385,7 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
     async def _finish_bridge_flow(self) -> ConfigFlowResult:
         new_data = {
             **self.config_entry.data,
-            CONF_MANAGED_BRIDGES: self._bridge_payloads,
+            CONF_BRIDGES: self._bridge_payloads,
         }
         self.hass.config_entries.async_update_entry(
             self.config_entry,

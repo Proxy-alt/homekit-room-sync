@@ -3,190 +3,252 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Iterable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import area_registry, device_registry, entity_registry
 
 from .const import (
-    CONF_ALLOWED_AREAS,
-    CONF_BRIDGE_ID,
-    CONF_BRIDGE_NAME,
-    CONF_BRIDGE_TITLE,
-    CONF_DEFAULT_ROOM,
+    CONF_AREAS,
+    CONF_BRIDGES,
+    CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
-    CONF_MANAGED_BRIDGES,
 )
-from .coordinator import HomeKitRoomSyncCoordinator
-from .storage import HomeKitStorageClient
 
 _LOGGER = logging.getLogger(__name__)
 
 
+def _as_str_set(values: object) -> set[str]:
+    if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
+        return {str(item) for item in values if isinstance(item, str)}
+    return set()
+
+
 @dataclass(slots=True)
-class ManagedBridgeConfig:
-    """In-memory representation of a HomeKit bridge configuration."""
+class BridgeConfig:
+    """Normalized configuration for a managed HomeKit bridge."""
 
-    bridge_id: str
-    friendly_name: str
-    allowed_areas: set[str]
-    include_entities: set[str]
-    exclude_entities: set[str]
-    default_room: str | None
-
-    @property
-    def title(self) -> str:
-        """Return the human-friendly title."""
-        return self.friendly_name or self.bridge_id
-
-    def serialize(self) -> dict[str, object]:
-        """Convert to dict suitable for ConfigEntry data."""
-        return {
-            CONF_BRIDGE_ID: self.bridge_id,
-            CONF_BRIDGE_TITLE: self.friendly_name,
-            CONF_ALLOWED_AREAS: sorted(self.allowed_areas),
-            CONF_INCLUDE_ENTITIES: sorted(self.include_entities),
-            CONF_EXCLUDE_ENTITIES: sorted(self.exclude_entities),
-            CONF_DEFAULT_ROOM: self.default_room,
-        }
+    entry_id: str
+    areas: frozenset[str]
+    include_entities: frozenset[str]
+    exclude_entities: frozenset[str]
 
     @classmethod
-    def from_dict(cls, raw: dict[str, object]) -> ManagedBridgeConfig:
-        """Create a config from stored data."""
+    def from_dict(cls, raw: dict[str, object]) -> BridgeConfig | None:
+        entry_id = str(raw.get(CONF_ENTRY_ID) or "").strip()
+        if not entry_id:
+            return None
+
         return cls(
-            bridge_id=str(
-                raw.get(CONF_BRIDGE_ID) or raw.get(CONF_BRIDGE_NAME) or ""
-            ),
-            friendly_name=str(raw.get(CONF_BRIDGE_TITLE) or raw.get(CONF_BRIDGE_NAME) or ""),
-            allowed_areas=set(_coerce_str_list(raw.get(CONF_ALLOWED_AREAS))),
-            include_entities=set(_coerce_str_list(raw.get(CONF_INCLUDE_ENTITIES))),
-            exclude_entities=set(_coerce_str_list(raw.get(CONF_EXCLUDE_ENTITIES))),
-            default_room=_coerce_optional_str(raw.get(CONF_DEFAULT_ROOM)),
+            entry_id=entry_id,
+            areas=frozenset(_as_str_set(raw.get(CONF_AREAS))),
+            include_entities=frozenset(_as_str_set(raw.get(CONF_INCLUDE_ENTITIES))),
+            exclude_entities=frozenset(_as_str_set(raw.get(CONF_EXCLUDE_ENTITIES))),
         )
 
-
-def _coerce_str_list(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value if isinstance(item, str)]
-    if isinstance(value, tuple):
-        return [str(item) for item in value if isinstance(item, str)]
-    return []
-
-
-def _coerce_optional_str(value: object) -> str | None:
-    if isinstance(value, str):
-        value = value.strip()
-        return value or None
-    return None
+    def serialize(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+        return {
+            CONF_ENTRY_ID: self.entry_id,
+            CONF_AREAS: sorted(self.areas),
+            CONF_INCLUDE_ENTITIES: sorted(self.include_entities),
+            CONF_EXCLUDE_ENTITIES: sorted(self.exclude_entities),
+        }
 
 
-def parse_managed_bridge_configs(entry: ConfigEntry) -> list[ManagedBridgeConfig]:
-    """Parse managed bridge configurations from a config entry."""
-    configs: list[ManagedBridgeConfig] = []
-
-    stored = entry.data.get(CONF_MANAGED_BRIDGES)
+def parse_bridge_configs(entry: ConfigEntry) -> list[BridgeConfig]:
+    """Parse bridge configs from the integration entry."""
+    configs: list[BridgeConfig] = []
+    stored = entry.data.get(CONF_BRIDGES)
     if isinstance(stored, Iterable):
         for raw in stored:
-            if isinstance(raw, dict):
-                cfg = ManagedBridgeConfig.from_dict(raw)
-                if cfg.bridge_id:
-                    configs.append(cfg)
-        return configs
-
-    # Legacy single-bridge entries (version 1)
-    legacy_bridge_id = entry.data.get(CONF_BRIDGE_NAME)
-    if isinstance(legacy_bridge_id, str) and legacy_bridge_id:
-        configs.append(
-            ManagedBridgeConfig(
-                bridge_id=legacy_bridge_id,
-                friendly_name=entry.title or legacy_bridge_id,
-                allowed_areas=set(_coerce_str_list(entry.data.get(CONF_ALLOWED_AREAS))),
-                include_entities=set(),
-                exclude_entities=set(),
-                default_room=_coerce_optional_str(entry.data.get(CONF_DEFAULT_ROOM)),
-            )
-        )
-
+            if isinstance(raw, dict) and (cfg := BridgeConfig.from_dict(raw)):
+                configs.append(cfg)
     return configs
 
 
 class HomeKitBridgeManager:
-    """Manage multiple HomeKit Room Sync coordinators."""
+    """Compute entity filters and push them into HomeKit config entries."""
 
     def __init__(
         self,
         hass: HomeAssistant,
         entry: ConfigEntry,
-        bridge_configs: list[ManagedBridgeConfig],
+        bridge_configs: list[BridgeConfig],
     ) -> None:
-        """Initialize the manager."""
         self._hass = hass
         self._entry = entry
-        self._storage = HomeKitStorageClient(hass)
-        self._coordinators: dict[str, HomeKitRoomSyncCoordinator] = {
-            cfg.bridge_id: HomeKitRoomSyncCoordinator(
-                hass,
-                entry,
-                cfg,
-                self._storage,
-            )
-            for cfg in bridge_configs
-        }
+        self._configs = {cfg.entry_id: cfg for cfg in bridge_configs}
 
     @property
     def bridge_ids(self) -> list[str]:
-        """Return the managed bridge IDs."""
-        return list(self._coordinators.keys())
+        """Return managed HomeKit entry_ids."""
+        return list(self._configs.keys())
 
-    def get_friendly_name(self, bridge_id: str) -> str:
-        """Return the friendly name for a bridge ID."""
-        coordinator = self._coordinators.get(bridge_id)
-        if coordinator is None:
-            return bridge_id
-        return coordinator.config.title
+    async def async_sync(self, bridge_entry_id: str | None = None) -> bool:
+        """Recompute filters for one or all bridges."""
+        if bridge_entry_id and bridge_entry_id not in self._configs:
+            _LOGGER.warning(
+                "Sync requested for unknown HomeKit entry_id %s",
+                bridge_entry_id,
+            )
+            return False
 
-    async def async_sync(self, bridge_id: str | None = None) -> bool:
-        """Trigger synchronization."""
-        if bridge_id:
-            coordinator = self._coordinators.get(bridge_id)
-            if not coordinator:
-                _LOGGER.warning(
-                    "Requested sync for unknown HomeKit bridge %s",
-                    bridge_id,
-                )
-                return False
-            return await coordinator.async_sync_rooms()
+        targets = (
+            [self._configs[bridge_entry_id]]
+            if bridge_entry_id
+            else list(self._configs.values())
+        )
 
-        if not self._coordinators:
-            _LOGGER.debug("No HomeKit bridges configured for entry %s", self._entry.title)
+        if not targets:
+            _LOGGER.debug(
+                "No HomeKit bridges configured for %s", self._entry.entry_id
+            )
             return True
 
         results = await asyncio.gather(
-            *(coord.async_sync_rooms() for coord in self._coordinators.values()),
+            *(self._async_sync_bridge(cfg) for cfg in targets),
             return_exceptions=True,
         )
-
         success = True
-        for bridge_id, result in zip(self._coordinators, results, strict=False):
+        for cfg, result in zip(targets, results, strict=False):
             if isinstance(result, Exception):
                 success = False
                 _LOGGER.error(
-                    "Sync failed for HomeKit bridge %s: %s",
-                    bridge_id,
+                    "Failed to sync HomeKit entry %s: %s",
+                    cfg.entry_id,
                     result,
                 )
-            elif result is False:
+            elif not result:
                 success = False
         return success
 
     async def async_shutdown(self) -> None:
-        """Cleanup resources when entry unloads."""
-        self._coordinators.clear()
+        """Placeholder for future resources."""
+        self._configs.clear()
 
-    @property
-    def coordinators(self) -> dict[str, HomeKitRoomSyncCoordinator]:
-        """Expose coordinators for testing."""
-        return self._coordinators
+    async def _async_sync_bridge(self, config: BridgeConfig) -> bool:
+        homekit_entry = self._hass.config_entries.async_get_entry(config.entry_id)
+        if homekit_entry is None:
+            _LOGGER.warning(
+                "HomeKit entry %s is no longer available; skipping",
+                config.entry_id,
+            )
+            return False
+
+        ent_reg = entity_registry.async_get(self._hass)
+        dev_reg = device_registry.async_get(self._hass)
+        area_reg = area_registry.async_get(self._hass)
+
+        area_entities = self._entities_in_areas(config, ent_reg, dev_reg)
+        allowed_entities = sorted(
+            (area_entities | set(config.include_entities)) - set(config.exclude_entities)
+        )
+        rooms = self._room_map_for_entities(
+            allowed_entities,
+            ent_reg,
+            dev_reg,
+            area_reg,
+        )
+
+        updated_data = self._build_updated_data(
+            homekit_entry,
+            allowed_entities,
+            rooms,
+        )
+        if updated_data is None:
+            _LOGGER.debug(
+                "No HomeKit data changes detected for entry %s",
+                config.entry_id,
+            )
+            return True
+
+        self._hass.config_entries.async_update_entry(
+            homekit_entry,
+            data=updated_data,
+        )
+        await self._hass.config_entries.async_reload(homekit_entry.entry_id)
+        _LOGGER.info(
+            "Synchronized %s entities for HomeKit entry %s",
+            len(allowed_entities),
+            homekit_entry.entry_id,
+        )
+        return True
+
+    def _entities_in_areas(
+        self,
+        config: BridgeConfig,
+        ent_reg,
+        dev_reg,
+    ) -> set[str]:
+        """Return entity_ids that live inside the configured areas."""
+        entries = getattr(ent_reg, "entities", {})
+        if not entries:
+            return set()
+
+        entities: set[str] = set()
+        if not config.areas:
+            # Legacy behavior: empty selection means include every entity the bridge exposes.
+            return {entry.entity_id for entry in entries.values()}
+
+        for entry in entries.values():
+            area_id = entry.area_id or self._device_area_id(dev_reg, entry.device_id)
+            if area_id in config.areas:
+                entities.add(entry.entity_id)
+        return entities
+
+    def _room_map_for_entities(
+        self,
+        entity_ids: list[str],
+        ent_reg,
+        dev_reg,
+        area_reg,
+    ) -> dict[str, str | None]:
+        rooms: dict[str, str | None] = {}
+        for entity_id in entity_ids:
+            entry = ent_reg.async_get(entity_id) if hasattr(ent_reg, "async_get") else None
+            area_id = None
+            if entry:
+                area_id = entry.area_id or self._device_area_id(dev_reg, entry.device_id)
+            if area_id:
+                area = area_reg.async_get_area(area_id)
+                rooms[entity_id] = area.name if area else None
+            else:
+                rooms[entity_id] = None
+        return rooms
+
+    @staticmethod
+    def _device_area_id(dev_reg, device_id: str | None) -> str | None:
+        if not device_id or not hasattr(dev_reg, "async_get"):
+            return None
+        device = dev_reg.async_get(device_id)
+        return device.area_id if device else None
+
+    @staticmethod
+    def _build_updated_data(
+        homekit_entry: ConfigEntry,
+        allowed_entities: list[str],
+        rooms: dict[str, str | None],
+    ) -> dict[str, object] | None:
+        new_data = copy.deepcopy(homekit_entry.data)
+        new_data["filter"] = {
+            "include_entities": allowed_entities,
+            "exclude_entities": [],
+        }
+
+        existing_entity_config = dict(new_data.get("entity_config") or {})
+        for entity_id, area_name in rooms.items():
+            existing_entry = existing_entity_config.get(entity_id, {})
+            existing_entry["name"] = None
+            existing_entry["room"] = area_name
+            existing_entity_config[entity_id] = existing_entry
+        new_data["entity_config"] = existing_entity_config
+
+        if new_data == homekit_entry.data:
+            return None
+        return new_data

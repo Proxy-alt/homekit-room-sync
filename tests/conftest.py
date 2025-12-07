@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import sys
-from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -30,18 +27,28 @@ sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
 sys.modules["homeassistant.helpers.event"] = event
 
 from custom_components.homekit_room_sync.const import (
-    CONF_ALLOWED_AREAS,
-    CONF_BRIDGE_ID,
-    CONF_BRIDGE_TITLE,
-    CONF_DEFAULT_ROOM,
+    CONF_AREAS,
+    CONF_BRIDGES,
+    CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
-    CONF_MANAGED_BRIDGES,
+    DOMAIN,
+    HOMEKIT_DOMAIN,
 )
 
 
 @pytest.fixture
-def mock_hass() -> MagicMock:
+def mock_homekit_entry() -> MagicMock:
+    """Create a mock HomeKit config entry."""
+    entry = MagicMock()
+    entry.entry_id = "homekit_entry_1"
+    entry.title = "Living Bridge"
+    entry.data = {"filter": {}, "entity_config": {}}
+    return entry
+
+
+@pytest.fixture
+def mock_hass(mock_homekit_entry: MagicMock) -> MagicMock:
     """Create a mock Home Assistant instance."""
     hass = MagicMock()
     hass.config.path = MagicMock(return_value="/config")
@@ -52,6 +59,21 @@ def mock_hass() -> MagicMock:
     hass.services.async_call = AsyncMock()
     hass.services.async_register = MagicMock()
     hass.config_entries = MagicMock()
+
+    def _async_entries(domain: str | None = None):
+        if domain == HOMEKIT_DOMAIN:
+            return [mock_homekit_entry]
+        if domain == DOMAIN:
+            return []
+        return []
+
+    hass.config_entries.async_entries = MagicMock(side_effect=_async_entries)
+    hass.config_entries.async_get_entry = MagicMock(
+        side_effect=lambda entry_id: mock_homekit_entry
+        if entry_id == mock_homekit_entry.entry_id
+        else None
+    )
+    hass.config_entries.async_update_entry = MagicMock()
     hass.config_entries.async_reload = AsyncMock()
 
     # Mock async_add_executor_job to run synchronously
@@ -63,24 +85,22 @@ def mock_hass() -> MagicMock:
 
 
 @pytest.fixture
-def mock_config_entry() -> MagicMock:
+def mock_config_entry(mock_homekit_entry: MagicMock) -> MagicMock:
     """Create a mock config entry."""
     entry = MagicMock()
     entry.entry_id = "test_entry_id"
     entry.data = {
-        CONF_MANAGED_BRIDGES: [
+        CONF_BRIDGES: [
             {
-                CONF_BRIDGE_ID: "test_bridge",
-                CONF_BRIDGE_TITLE: "Test Bridge",
-                CONF_ALLOWED_AREAS: [],
-                CONF_DEFAULT_ROOM: "Living Room",
+                CONF_ENTRY_ID: mock_homekit_entry.entry_id,
+                CONF_AREAS: [],
                 CONF_INCLUDE_ENTITIES: [],
                 CONF_EXCLUDE_ENTITIES: [],
             }
         ]
     }
-    entry.title = "HomeKit Bridge: Test Bridge"
-    entry.version = 2
+    entry.title = "HomeKit Bridge: Living Bridge"
+    entry.version = 3
     entry.async_on_unload = MagicMock()
     entry.add_update_listener = MagicMock(return_value=MagicMock())
     return entry
@@ -93,14 +113,17 @@ def mock_entity_registry() -> MagicMock:
 
     # Create mock entity entries
     entity_with_area = MagicMock()
+    entity_with_area.entity_id = "light.living_room"
     entity_with_area.area_id = "area_living_room"
     entity_with_area.device_id = None
 
     entity_with_device = MagicMock()
+    entity_with_device.entity_id = "switch.bedroom"
     entity_with_device.area_id = None
     entity_with_device.device_id = "device_1"
 
     entity_without_area = MagicMock()
+    entity_without_area.entity_id = "sensor.unknown"
     entity_without_area.area_id = None
     entity_without_area.device_id = None
 
@@ -114,6 +137,7 @@ def mock_entity_registry() -> MagicMock:
         return entity_map.get(entity_id)
 
     registry.async_get = get_entity
+    registry.entities = entity_map
     return registry
 
 
@@ -162,44 +186,3 @@ def mock_area_registry() -> MagicMock:
     return registry
 
 
-@pytest.fixture
-def sample_homekit_storage() -> dict[str, Any]:
-    """Create sample HomeKit storage data."""
-    return {
-        "version": 1,
-        "key": "homekit.test_bridge.state",
-        "data": {
-            "accessories": [
-                {
-                    "entity_id": "light.living_room",
-                    "room_name": "Default Room",
-                },
-                {
-                    "entity_id": "switch.bedroom",
-                    "room_name": "Default Room",
-                },
-                {
-                    "entity_id": "sensor.unknown",
-                    "room_name": None,
-                },
-            ]
-        },
-    }
-
-
-@pytest.fixture
-def temp_storage_dir(tmp_path: Path) -> Path:
-    """Create a temporary storage directory."""
-    storage_dir = tmp_path / ".storage"
-    storage_dir.mkdir()
-    return storage_dir
-
-
-@pytest.fixture
-def mock_storage_file(
-    temp_storage_dir: Path, sample_homekit_storage: dict[str, Any]
-) -> Path:
-    """Create a mock HomeKit storage file."""
-    storage_file = temp_storage_dir / "homekit.test_bridge.state"
-    storage_file.write_text(json.dumps(sample_homekit_storage, indent=2))
-    return storage_file
