@@ -12,6 +12,7 @@ from tests.ha_mocks import homeassistant
 from tests.ha_mocks.homeassistant import config_entries, core
 from tests.ha_mocks.homeassistant.helpers import (
     area_registry,
+    config_validation,
     device_registry,
     entity_registry,
     event,
@@ -22,6 +23,7 @@ sys.modules["homeassistant.core"] = core
 sys.modules["homeassistant.config_entries"] = config_entries
 sys.modules["homeassistant.helpers"] = homeassistant.helpers
 sys.modules["homeassistant.helpers.area_registry"] = area_registry
+sys.modules["homeassistant.helpers.config_validation"] = config_validation
 sys.modules["homeassistant.helpers.device_registry"] = device_registry
 sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
 sys.modules["homeassistant.helpers.event"] = event

@@ -312,7 +312,7 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
         discovered = self._discover_homekit_bridges()
         current_configs = [
             managed
-            for managed in self.config_entry.data.get(CONF_BRIDGES, [])
+            for managed in self._config_entry.data.get(CONF_BRIDGES, [])
             if isinstance(managed, dict)
         ]
         current_ids = [
@@ -324,7 +324,7 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
         other_entries = [
             entry
             for entry in self.hass.config_entries.async_entries(DOMAIN)
-            if entry.entry_id != self.config_entry.entry_id
+            if entry.entry_id != self._config_entry.entry_id
         ]
         reserved_ids = {
             managed.get(CONF_ENTRY_ID)
@@ -384,11 +384,11 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
 
     async def _finish_bridge_flow(self) -> ConfigFlowResult:
         new_data = {
-            **self.config_entry.data,
+            **self._config_entry.data,
             CONF_BRIDGES: self._bridge_payloads,
         }
         self.hass.config_entries.async_update_entry(
-            self.config_entry,
+            self._config_entry,
             data=new_data,
         )
         return self.async_create_entry(title="", data={})

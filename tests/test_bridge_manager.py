@@ -100,4 +100,3 @@ async def test_manager_respects_manual_overrides(
     assert updated_entities == ["light.living_room", "sensor.unknown"]
     entity_config = update_kwargs["data"]["entity_config"]
     assert entity_config["sensor.unknown"]["room"] is None
-*** End of File
