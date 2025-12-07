@@ -7,9 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from custom_components.homekit_room_sync.bridge_manager import (
+    _as_str_set,
     BridgeConfig,
     HomeKitBridgeManager,
+    parse_bridge_configs,
 )
+from custom_components.homekit_room_sync.const import CONF_BRIDGES
 
 
 @pytest.mark.asyncio
@@ -100,3 +103,20 @@ async def test_manager_respects_manual_overrides(
     assert updated_entities == ["light.living_room", "sensor.unknown"]
     entity_config = update_kwargs["data"]["entity_config"]
     assert entity_config["sensor.unknown"]["room"] is None
+
+
+def test_as_str_set_converts_non_strings() -> None:
+    """_as_str_set should include non-string iterables as strings."""
+    data = {1, "two", 3}
+    assert _as_str_set(data) == {"1", "two", "3"}
+
+    # Strings/bytes are treated as scalar, not iterable for our purposes
+    assert _as_str_set("abc") == set()
+    assert _as_str_set(b"bytes") == set()
+
+
+def test_parse_bridge_configs_ignores_string_conf() -> None:
+    """parse_bridge_configs should not iterate over string/bytes configs."""
+    entry = MagicMock()
+    entry.data = {CONF_BRIDGES: "not-a-list"}
+    assert parse_bridge_configs(entry) == []

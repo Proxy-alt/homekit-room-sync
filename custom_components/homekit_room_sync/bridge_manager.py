@@ -24,9 +24,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _as_str_set(values: object) -> set[str]:
-    if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
-        return {str(item) for item in values if isinstance(item, str)}
-    return set()
+    if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+        return set()
+
+    result: set[str] = set()
+    for item in values:
+        stringified = str(item).strip()
+        if stringified:
+            result.add(stringified)
+    return result
 
 
 @dataclass(slots=True)
@@ -65,7 +71,7 @@ def parse_bridge_configs(entry: ConfigEntry) -> list[BridgeConfig]:
     """Parse bridge configs from the integration entry."""
     configs: list[BridgeConfig] = []
     stored = entry.data.get(CONF_BRIDGES)
-    if isinstance(stored, Iterable):
+    if isinstance(stored, Iterable) and not isinstance(stored, (str, bytes)):
         for raw in stored:
             if isinstance(raw, dict) and (cfg := BridgeConfig.from_dict(raw)):
                 configs.append(cfg)
