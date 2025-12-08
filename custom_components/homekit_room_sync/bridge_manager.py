@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import zlib
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Final, Iterable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -18,9 +19,30 @@ from .const import (
     CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
+    HOMEKIT_DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_PORT_RANGE_START: Final = 20000
+_PORT_RANGE_SIZE: Final = 30000
+
+
+def _preferred_port(entry_id: str) -> int:
+    """Return a deterministic preferred port for a HomeKit entry."""
+    digest = zlib.adler32(entry_id.encode("utf-8")) & 0xFFFFFFFF
+    return _PORT_RANGE_START + (digest % _PORT_RANGE_SIZE)
+
+
+def _pick_new_port(entry_id: str, used_ports: set[int]) -> int | None:
+    """Pick a deterministic port that is not currently reserved."""
+    preferred = _preferred_port(entry_id)
+    normalized = preferred - _PORT_RANGE_START
+    for offset in range(_PORT_RANGE_SIZE):
+        candidate = _PORT_RANGE_START + ((normalized + offset) % _PORT_RANGE_SIZE)
+        if candidate not in used_ports:
+            return candidate
+    return None
 
 
 def _as_str_set(values: object) -> set[str]:
@@ -65,6 +87,18 @@ class BridgeConfig:
             CONF_INCLUDE_ENTITIES: sorted(self.include_entities),
             CONF_EXCLUDE_ENTITIES: sorted(self.exclude_entities),
         }
+
+
+@dataclass(slots=True)
+class ManagedBridgeConfig:
+    """Compatibility config used by legacy coordinator tests."""
+
+    bridge_id: str
+    friendly_name: str
+    allowed_areas: set[str]
+    include_entities: set[str]
+    exclude_entities: set[str]
+    default_room: str | None = None
 
 
 def parse_bridge_configs(entry: ConfigEntry) -> list[BridgeConfig]:
@@ -173,6 +207,11 @@ class HomeKitBridgeManager:
             rooms,
         )
         if updated_data is None:
+            # No filter/entity updates, but we still might need to adjust the port.
+            updated_data = copy.deepcopy(dict(homekit_entry.data))
+
+        port_changed = self._resolve_port_conflicts(homekit_entry, updated_data)
+        if not port_changed and updated_data == homekit_entry.data:
             _LOGGER.debug(
                 "No HomeKit data changes detected for entry %s",
                 config.entry_id,
@@ -264,3 +303,57 @@ class HomeKitBridgeManager:
         if new_data == homekit_entry.data:
             return None
         return new_data
+
+    def _current_homekit_ports(self) -> dict[str, int]:
+        """Return a map of HomeKit entry_id to the currently configured port."""
+        entries = self._hass.config_entries.async_entries(HOMEKIT_DOMAIN)
+        result: dict[str, int] = {}
+        for entry in entries:
+            port = entry.data.get("port")
+            if isinstance(port, int):
+                result[entry.entry_id] = port
+        return result
+
+    def _resolve_port_conflicts(
+        self,
+        homekit_entry: ConfigEntry,
+        new_data: dict[str, object],
+    ) -> bool:
+        """Ensure the HomeKit entry is not configured to use a duplicate port."""
+        current_port = new_data.get("port")
+        if not isinstance(current_port, int):
+            return False
+
+        port_map = self._current_homekit_ports()
+        duplicates = [
+            entry_id
+            for entry_id, port in port_map.items()
+            if entry_id != homekit_entry.entry_id and port == current_port
+        ]
+        if not duplicates:
+            return False
+
+        used_ports = {
+            port
+            for entry_id, port in port_map.items()
+            if entry_id != homekit_entry.entry_id
+        }
+        replacement = _pick_new_port(homekit_entry.entry_id, used_ports)
+        if replacement is None:
+            _LOGGER.error(
+                "Unable to resolve HomeKit port conflict for %s; "
+                "multiple bridges are configured to use %s",
+                homekit_entry.entry_id,
+                current_port,
+            )
+            return False
+
+        new_data["port"] = replacement
+        _LOGGER.warning(
+            "HomeKit entry %s shared TCP port %s with %s; reassigned to %s",
+            homekit_entry.entry_id,
+            current_port,
+            ", ".join(sorted(duplicates)),
+            replacement,
+        )
+        return True
