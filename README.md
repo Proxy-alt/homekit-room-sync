@@ -1,5 +1,7 @@
 # HomeKit Room Sync
 
+_note_ - never got this fully working, but feel free to cut a PR or fork if you have any ideas or suggestions 
+
 [![Status: Pre-Alpha](https://img.shields.io/badge/Status-Pre--Alpha-red.svg)](https://github.com/lcrostarosa/homekit-room-sync)
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
