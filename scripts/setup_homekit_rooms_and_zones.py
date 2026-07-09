@@ -317,6 +317,14 @@ def discover_top_level_commands(binary: str) -> set[str]:
 _SERIAL_NUMBER_CHARACTERISTIC_TYPE = "00000030-0000-1000-8000-0026BB765291"
 
 
+@dataclass
+class AccessoryInfo:
+    """A HomeKit accessory resolved by HAP Serial Number, and its current room."""
+
+    uuid: str
+    current_room: str | None
+
+
 def _run_cli_json(binary: str, args: list[str]) -> dict | list:
     result = subprocess.run(
         [binary, *args], capture_output=True, text=True, timeout=30, check=False
@@ -328,8 +336,8 @@ def _run_cli_json(binary: str, args: list[str]) -> dict | list:
     return json.loads(result.stdout)
 
 
-def discover_accessory_serial_map(binary: str, is_grouped: bool) -> dict[str, str]:
-    """Return {serial_number: accessory_uuid} for every accessory HomeClaw knows about.
+def discover_accessory_info(binary: str, is_grouped: bool) -> dict[str, AccessoryInfo]:
+    """Return {serial_number: AccessoryInfo} for every accessory HomeClaw knows about.
 
     Best-effort: any failure (HomeClaw not reachable, unexpected output,
     timeout) returns {} rather than raising, so callers can fall back to
@@ -352,7 +360,7 @@ def discover_accessory_serial_map(binary: str, is_grouped: bool) -> dict[str, st
 
     total = len(accessory_ids)
     print(f"Resolving {total} accessories by HomeKit serial number...")
-    serial_to_uuid: dict[str, str] = {}
+    serial_to_info: dict[str, AccessoryInfo] = {}
     for index, accessory_id in enumerate(accessory_ids, start=1):
         if total > 20 and index % 20 == 0:
             print(f"  ...{index}/{total}", file=sys.stderr)
@@ -361,32 +369,34 @@ def discover_accessory_serial_map(binary: str, is_grouped: bool) -> dict[str, st
                 detail = _run_cli_json(
                     binary, ["accessories", "get", accessory_id, "--format", "json"]
                 )
-                services = detail.get("accessory", {}).get("services", [])
+                accessory = detail.get("accessory", {})
             else:
-                detail = _run_cli_json(binary, ["get", accessory_id, "--json", "--no-refresh"])
-                services = detail.get("services", [])
+                accessory = _run_cli_json(binary, ["get", accessory_id, "--json", "--no-refresh"])
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
             continue
 
-        for service in services:
+        current_room = accessory.get("room") or accessory.get("roomName")
+        for service in accessory.get("services", []):
             for characteristic in service.get("characteristics", []):
                 if characteristic.get("type", "").upper() == _SERIAL_NUMBER_CHARACTERISTIC_TYPE:
                     serial = characteristic.get("value")
                     if serial and serial != "--":
-                        serial_to_uuid[serial] = accessory_id
+                        serial_to_info[serial] = AccessoryInfo(
+                            uuid=accessory_id, current_room=current_room
+                        )
                     break
 
-    print(f"  matched {len(serial_to_uuid)}/{total} accessories by serial number")
-    return serial_to_uuid
+    print(f"  matched {len(serial_to_info)}/{total} accessories by serial number")
+    return serial_to_info
 
 
 def _resolve_identifier(
-    entity_id: str, friendly_name: str, serial_to_uuid: dict[str, str]
+    entity_id: str, friendly_name: str, serial_to_info: dict[str, AccessoryInfo]
 ) -> tuple[str, str]:
     """Return (identifier-to-pass-to-the-CLI, human-readable label for messages)."""
-    uuid = serial_to_uuid.get(entity_id)
-    if uuid:
-        return uuid, f"{friendly_name} ({entity_id}, matched by serial number)"
+    info = serial_to_info.get(entity_id)
+    if info:
+        return info.uuid, f"{friendly_name} ({entity_id}, matched by serial number)"
     return friendly_name, f"{friendly_name} (matched by name -- no serial-number match found)"
 
 
@@ -395,7 +405,8 @@ def render_command_script(
     floor_plans: list[FloorPlan],
     binary: str,
     top_level_commands: set[str],
-    serial_to_uuid: dict[str, str],
+    serial_to_info: dict[str, AccessoryInfo],
+    cleanup_candidates: list[str],
 ) -> str:
     """Render a plain, readable .command shell script that applies the plans.
 
@@ -407,9 +418,17 @@ def render_command_script(
     of simulated -- this script never clicks anything in Home.app; see the
     module docstring for why.
 
-    Each accessory is identified by its HomeKit UUID when `serial_to_uuid`
+    Each accessory is identified by its HomeKit UUID when `serial_to_info`
     has a match for that entity_id (exact), falling back to its HA
     friendly_name otherwise (best-effort; see module docstring).
+
+    `cleanup_candidates` are room names accessories are being moved *out of*
+    this run (their pre-assignment room, from HomeClaw's own data) that
+    aren't also one of our own target rooms. If non-empty, the generated
+    script re-checks each one live *after* all assignments run and only
+    removes ones actually confirmed empty at that point -- never a room
+    that's merely "empty" in this plan; that check happens against HomeKit's
+    real state, at runtime, right before removal.
     """
     is_grouped = {"rooms", "zones"} <= top_level_commands
     is_flat = {"create-room", "create-zone"} <= top_level_commands
@@ -460,7 +479,7 @@ def render_command_script(
         for plan in room_plans:
             room_q = shlex.quote(plan.room_name)
             for entity_id, friendly_name in plan.entities:
-                identifier, label = _resolve_identifier(entity_id, friendly_name, serial_to_uuid)
+                identifier, label = _resolve_identifier(entity_id, friendly_name, serial_to_info)
                 identifier_q = shlex.quote(identifier)
                 fail_msg = echo(f"  failed: {label} -> {plan.room_name}", stderr=True)
                 lines.append(
@@ -481,9 +500,9 @@ def render_command_script(
             assignments = []
             for plan in room_plans:
                 for entity_id, friendly_name in plan.entities:
-                    uuid = serial_to_uuid.get(entity_id)
-                    if uuid:
-                        assignments.append({"uuid": uuid, "room": plan.room_name})
+                    info = serial_to_info.get(entity_id)
+                    if info:
+                        assignments.append({"uuid": info.uuid, "room": plan.room_name})
                     else:
                         assignments.append({"accessory": friendly_name, "room": plan.room_name})
             assignments_json = json.dumps(assignments, indent=2)
@@ -567,6 +586,68 @@ def render_command_script(
             lines.append("manual_needed=$((manual_needed+1))")
         lines.append("")
 
+    # --- Cleanup: remove rooms that ended up empty after the moves above ---
+    if cleanup_candidates:
+        list_all_cmd = (
+            f"{binary} accessories list --format json 2>/dev/null"
+            if is_grouped
+            else f"{binary} list --json 2>/dev/null"
+        )
+        # Count client-side from the *full* accessory list rather than trusting
+        # the CLI's own --room filter: verified live that it silently returns
+        # zero results for multi-word room names (e.g. "Default Room", the
+        # single most common HomeKit room name) while the room actually had
+        # dozens of accessories in it -- which would have caused this feature
+        # to wrongfully delete a room still full of accessories. Fetching once
+        # and filtering ourselves (python3 is already a hard requirement to
+        # have generated this file at all; no jq dependency needed) sidesteps
+        # that entirely. On any parse failure this prints -1, which the caller
+        # treats as "unknown, don't touch it" rather than "empty, safe to remove".
+        counter = (
+            "import json,sys\n"
+            "try:\n"
+            "    with open(sys.argv[2]) as f:\n"
+            "        d = json.load(f)\n"
+            "except Exception:\n"
+            "    print(-1)\n"
+            "else:\n"
+            '    items = d if isinstance(d, list) else d.get("accessories", [])\n'
+            "    target = sys.argv[1]\n"
+            '    n = sum(1 for a in items if (a.get("room") or a.get("roomName")) == target)\n'
+            "    print(n)"
+        )
+        lines.append(echo("== Cleanup: removing now-empty rooms =="))
+        lines += [
+            "ACCESSORIES_CACHE=$(mktemp -t homekit_accessories_cache).json",
+            f'{list_all_cmd} > "$ACCESSORIES_CACHE"',
+            "count_accessories_in_room() {",
+            f'  python3 -c \'{counter}\' "$1" "$ACCESSORIES_CACHE"',
+            "}",
+            "",
+        ]
+        for room_name in cleanup_candidates:
+            room_q = shlex.quote(room_name)
+            lines.append(f"ROOM_COUNT=$(count_accessories_in_room {room_q})")
+            lines.append('if [ "$ROOM_COUNT" = "0" ]; then')
+            fail_msg = echo(f"  could not remove empty room {room_name}", stderr=True)
+            if is_grouped:
+                lines.append(
+                    f"  {binary} rooms remove {room_q} --allow-mutation $DRY_RUN_FLAG || {fail_msg}"
+                )
+            elif is_flat:
+                lines.append(f"  {binary} remove-room {room_q} $DRY_RUN_FLAG || {fail_msg}")
+            lines.append('elif [ "$ROOM_COUNT" != "-1" ]; then')
+            # $ROOM_COUNT must actually expand here, unlike everywhere else `echo()`
+            # is used -- so build this one line by hand: the untrusted room name
+            # stays single-quoted (safe), $ROOM_COUNT sits in its own
+            # double-quoted segment (bash concatenates adjacent quoted strings).
+            skip_prefix = shlex.quote(f"  {room_name} still has ")
+            skip_suffix = shlex.quote(" accessorie(s); leaving it.")
+            lines.append(f'  echo {skip_prefix}"$ROOM_COUNT"{skip_suffix}')
+            lines.append("fi")
+        lines.append('rm -f "$ACCESSORIES_CACHE"')
+        lines.append("")
+
     lines += [
         'if [ "$failures" -gt 0 ] || [ "$manual_needed" -gt 0 ]; then',
         '  echo ""',
@@ -601,6 +682,15 @@ async def main() -> int:
         default=Path.cwd() / "homekit_rooms_and_zones_setup.command",
         help="Where to write the generated .command file "
         "(default: ./homekit_rooms_and_zones_setup.command)",
+    )
+    parser.add_argument(
+        "--delete-empty-rooms",
+        action="store_true",
+        help="After moving accessories, remove any room they were moved OUT of that ends up "
+        "with zero accessories. Only ever removes a room the generated script has just "
+        "verified is empty against HomeKit's live state at that point -- never a room "
+        "that merely looks empty in this plan, and never one of the target rooms "
+        "themselves.",
     )
     args = parser.parse_args()
 
@@ -638,10 +728,25 @@ async def main() -> int:
 
     is_grouped = {"rooms", "zones"} <= top_level_commands
     print()
-    serial_to_uuid = discover_accessory_serial_map(binary, is_grouped)
+    serial_to_info = discover_accessory_info(binary, is_grouped)
+
+    cleanup_candidates: list[str] = []
+    if args.delete_empty_rooms:
+        target_room_names = {plan.room_name for plan in room_plans}
+        source_rooms: set[str] = set()
+        for plan in room_plans:
+            for entity_id, _friendly_name in plan.entities:
+                info = serial_to_info.get(entity_id)
+                if info and info.current_room and info.current_room != plan.room_name:
+                    source_rooms.add(info.current_room)
+        cleanup_candidates = sorted(source_rooms - target_room_names)
+        if cleanup_candidates:
+            print(
+                f"Will check for emptiness after moving accessories: {', '.join(cleanup_candidates)}"
+            )
 
     script_text = render_command_script(
-        room_plans, floor_plans, binary, top_level_commands, serial_to_uuid
+        room_plans, floor_plans, binary, top_level_commands, serial_to_info, cleanup_candidates
     )
     args.output.write_text(script_text)
     args.output.chmod(0o755)

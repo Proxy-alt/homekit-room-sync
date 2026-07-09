@@ -108,6 +108,8 @@ python3 scripts/setup_homekit_rooms_and_zones.py --ha-url http://homeassistant.l
 
 Then **open the generated file in a text editor and read it** — it's a short, plain shell script, and every command it will run is right there in plain sight, nothing is hidden behind Python subprocess calls. Preview it first (`./homekit_rooms_and_zones_setup.command --dry-run`), then run it for real once you're happy with it.
 
+Pass `--delete-empty-rooms` to also clean up afterward: for each room an accessory got moved *out of* this run (e.g. "Default Room"), the generated script re-checks — live, against HomeKit's actual state, right before acting — whether it's now empty, and only removes it if so. It never touches a room that still has anything in it, and never touches one of the target rooms themselves, even if this run didn't manage to put anything in it.
+
 **There are two separate, legitimate CLI front-ends to HomeClaw, and it's easy to mix them up (we did, building this):**
 
 | | `homeclaw-cli` | `homekit` |
