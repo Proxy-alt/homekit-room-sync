@@ -44,10 +44,15 @@ async def test_manager_updates_homekit_entry(
     mock_config_entry: MagicMock,
     mock_entity_registry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
-    """Manager should update filter + entity_config based on areas."""
+    """Manager should update the HomeKit filter based on configured areas.
+
+    Room assignment is NOT part of this: the core `homekit` component has no
+    "room" entity_config key at all, so it can never be set by a bridge --
+    only a HomeKit controller app (e.g. HomeClaw) can do that. See
+    scripts/setup_homekit_rooms_and_zones.py.
+    """
     config = BridgeConfig(
         entry_id=mock_homekit_entry.entry_id,
         areas=frozenset({"area_living_room", "area_bedroom"}),
@@ -65,10 +70,6 @@ async def test_manager_updates_homekit_entry(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -80,9 +81,9 @@ async def test_manager_updates_homekit_entry(
         "light.living_room",
         "switch.bedroom",
     ]
-    entity_config = updated_data["entity_config"]
-    assert entity_config["light.living_room"]["room"] == "Living Room"
-    assert entity_config["switch.bedroom"]["room"] == "Bedroom"
+    # No linked sensors/type overrides apply to these fixtures, so nothing
+    # needs writing to entity_config at all.
+    assert updated_data["entity_config"] == {}
     mock_hass.config_entries.async_reload.assert_awaited_once()
 
 
@@ -92,7 +93,6 @@ async def test_manager_respects_manual_overrides(
     mock_config_entry: MagicMock,
     mock_entity_registry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """Include/exclude overrides should adjust final entity list."""
@@ -113,10 +113,6 @@ async def test_manager_respects_manual_overrides(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -124,8 +120,6 @@ async def test_manager_respects_manual_overrides(
     update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
     updated_entities = update_kwargs["data"]["filter"]["include_entities"]
     assert updated_entities == ["light.living_room", "sensor.unknown"]
-    entity_config = update_kwargs["data"]["entity_config"]
-    assert entity_config["sensor.unknown"]["room"] is None
 
 
 @pytest.mark.asyncio
@@ -134,10 +128,9 @@ async def test_manager_preserves_existing_name_override(
     mock_config_entry: MagicMock,
     mock_entity_registry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
-    """Syncing rooms should not clobber a user's HomeKit name override."""
+    """Syncing should not clobber a user's HomeKit name override."""
     mock_homekit_entry.data = {
         "filter": {},
         "entity_config": {
@@ -162,10 +155,6 @@ async def test_manager_preserves_existing_name_override(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -173,7 +162,53 @@ async def test_manager_preserves_existing_name_override(
     update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
     entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
     assert entity_config["name"] == "Custom Lamp Name"
-    assert entity_config["room"] == "Living Room"
+
+
+@pytest.mark.asyncio
+async def test_manager_strips_stale_room_key(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_entity_registry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """A "room" key left over from before this was fixed should be dropped.
+
+    The core `homekit` component has no "room" entity_config key, so this
+    was always a silent no-op; leaving it in place is actively misleading.
+    """
+    mock_homekit_entry.data = {
+        "filter": {},
+        "entity_config": {
+            "light.living_room": {"room": "Living Room"},
+        },
+    }
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=mock_entity_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]
+    # The whole entry is dropped since "room" was its only key.
+    assert "light.living_room" not in entity_config
 
 
 @pytest.mark.asyncio
@@ -181,7 +216,6 @@ async def test_manager_auto_links_battery_sensor(
     mock_hass: MagicMock,
     mock_config_entry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """A same-device battery sensor should be auto-linked in entity_config."""
@@ -213,10 +247,6 @@ async def test_manager_auto_links_battery_sensor(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -233,7 +263,6 @@ async def test_manager_auto_link_does_not_override_manual_value(
     mock_hass: MagicMock,
     mock_config_entry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """A manually-configured linked sensor should win over auto-detection."""
@@ -271,10 +300,6 @@ async def test_manager_auto_link_does_not_override_manual_value(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -289,7 +314,6 @@ async def test_manager_auto_link_disabled(
     mock_hass: MagicMock,
     mock_config_entry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """link_related_sensors=False should skip auto-linking entirely."""
@@ -322,17 +346,13 @@ async def test_manager_auto_link_disabled(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
     assert result is True
     update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
-    entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
-    assert "linked_battery_sensor" not in entity_config
+    entity_config = update_kwargs["data"]["entity_config"]
+    assert "light.living_room" not in entity_config
 
 
 @pytest.mark.asyncio
@@ -340,7 +360,6 @@ async def test_manager_auto_detects_outlet_switch_type(
     mock_hass: MagicMock,
     mock_config_entry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """A switch entity with device_class 'outlet' should get type: outlet."""
@@ -371,10 +390,6 @@ async def test_manager_auto_detects_outlet_switch_type(
         patch(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
-        ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
         ),
     ):
         result = await manager.async_sync()
@@ -408,7 +423,6 @@ async def test_manager_resolves_duplicate_port(
     mock_config_entry: MagicMock,
     mock_entity_registry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """A duplicate port should be reassigned before reloading HomeKit."""
@@ -446,10 +460,6 @@ async def test_manager_resolves_duplicate_port(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
         ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
-        ),
     ):
         result = await manager.async_sync()
 
@@ -466,7 +476,6 @@ async def test_port_conflict_triggers_update_without_filter_change(
     mock_config_entry: MagicMock,
     mock_entity_registry: MagicMock,
     mock_device_registry: MagicMock,
-    mock_area_registry: MagicMock,
     mock_homekit_entry: MagicMock,
 ) -> None:
     """Port conflicts are resolved even when no filter changes are detected."""
@@ -503,10 +512,6 @@ async def test_port_conflict_triggers_update_without_filter_change(
         patch(
             "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
             return_value=mock_device_registry,
-        ),
-        patch(
-            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
-            return_value=mock_area_registry,
         ),
         patch.object(
             HomeKitBridgeManager,

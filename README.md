@@ -7,7 +7,7 @@ _note_ - never got this fully working, but feel free to cut a PR or fork if you 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Contributors Welcome](https://img.shields.io/badge/Contributors-Welcome-brightgreen.svg)](https://github.com/lcrostarosa/homekit-room-sync/blob/master/CONTRIBUTING.md)
 
-A Home Assistant custom integration that automatically synchronizes your Home Assistant Areas with HomeKit Room assignments.
+A Home Assistant custom integration that automatically filters which entities are exposed to your HomeKit Bridge based on Home Assistant Areas — plus an optional companion script for actually placing them into matching Apple Home Rooms and Zones.
 
 ## Why This Exists
 
@@ -17,7 +17,9 @@ You can filter by domains (lights, switches, fans, etc.) and use wildcards, but 
 
 **The problem:** You organize your smart home by rooms (Areas) in Home Assistant, but HomeKit Bridge forces you to think in terms of entity types and naming patterns. This disconnect makes configuration fragile and tedious to maintain.
 
-**The solution:** HomeKit Room Sync bridges this gap. Organize your devices into Areas in Home Assistant, and this integration automatically syncs those room assignments to your HomeKit bridges. Add a device to an Area once, and it syncs to your Homekit Bridge.
+**The solution:** HomeKit Room Sync bridges this gap for *exposure*: organize your devices into Areas in Home Assistant, and this integration automatically keeps your HomeKit Bridge's entity filter in sync with them. Add a device to an Area once, and it starts showing up in your HomeKit Bridge without editing YAML.
+
+**Important — read this before expecting HomeKit Rooms to update:** HomeKit **Room** and **Zone** assignment are not something any HomeKit bridge or accessory can set — including this one, and including Home Assistant's own `homekit` integration. We verified this directly against HA core's source: its `homekit` component has no `"room"` key anywhere in its schema. Room and Zone placement are controller-app-only concepts (the same mechanism Home.app itself uses, `HMHome.assignAccessory`/`addRoom`/`addZone`). This integration only controls *which* entities reach your HomeKit Bridge. If you also want them to land in the right Apple Home Room/Zone automatically, see [Apple Home Rooms and Zones](#apple-home-rooms-and-zones-macos-only-optional) below — that part requires a separate, optional macOS-only script.
 
 ## Installation
 
@@ -56,11 +58,11 @@ You can filter by domains (lights, switches, fans, etc.) and use wildcards, but 
 Once configured, the integration works automatically in the background.
 
 1. **Assign Areas in Home Assistant**: Go to **Settings > Devices & Services > Entities** and assign an **Area** to your entities (e.g., assign a Light to "Living Room").
-2. **Wait for Sync**: The integration monitors these changes. After a short delay (debounced), it updates the HomeKit configuration.
-3. **Check Apple Home**: Open the Home app on your iOS device. The device should now be in the corresponding Room in HomeKit.
+2. **Wait for Sync**: The integration monitors these changes. After a short delay (debounced), it updates the HomeKit Bridge's entity filter (and any [auto-linked sensors](#auto-linked-sensors)) and reloads it.
+3. **Check Apple Home**: Open the Home app on your iOS device. The device should now be *exposed* through your HomeKit Bridge. It will land in "Default Room" until you either move it by hand in Home.app, or run the optional [Rooms and Zones script](#apple-home-rooms-and-zones-macos-only-optional) below.
 
 ![Apple Home Room](assets/apple_home_room.png)
-*Devices automatically assigned to the correct room in Apple Home*
+*An entity exposed through the HomeKit Bridge; placing it into the matching Room/Zone is handled by the separate script below, not by this integration.*
 
 ### Configuration Options
 
@@ -90,27 +92,29 @@ When **Auto-link related sensors** is enabled, HomeKit Room Sync looks for sibli
 
 This is **additive only** — it never overwrites a value you (or the native HomeKit integration options UI) already set for that entity, and it never removes a link once made, even if the sibling entity later disappears. To reset a stale link, clear it manually via the HomeKit Bridge integration's own entity options.
 
-**Known gaps we can't close from here:** this add-on only edits the HomeKit Bridge's `filter`/`entity_config`, so it can't add capabilities that require new HAP accessory categories. Two examples from Apple's recent HomeKit work that fall outside that scope: HomeKit's Robot Vacuum Cleaner category (added in iOS 18.4) — Home Assistant's `homekit` integration still exposes `vacuum` entities as plain switches, not real vacuum accessories — and HomeKit Secure Video, which isn't implemented by the HomeKit Bridge integration at all. Fixing either would mean patching Home Assistant core's `homekit` component itself. Apple Home "Zones" have a similar issue and are covered separately below.
+**Known gaps we can't close from here:** this add-on only edits the HomeKit Bridge's `filter`/`entity_config`, so it can't add capabilities that require new HAP accessory categories. Two examples from Apple's recent HomeKit work that fall outside that scope: HomeKit's Robot Vacuum Cleaner category (added in iOS 18.4) — Home Assistant's `homekit` integration still exposes `vacuum` entities as plain switches, not real vacuum accessories — and HomeKit Secure Video, which isn't implemented by the HomeKit Bridge integration at all. Fixing either would mean patching Home Assistant core's `homekit` component itself. Room and Zone assignment have a related but distinct issue and are covered separately below.
 
-### Apple Home Zones (macOS only, optional)
+### Apple Home Rooms and Zones (macOS only, optional)
 
-Apple Home "Zones" (e.g. grouping "Bedroom" + "Bathroom" into "Upstairs") are one level above Rooms. Unlike Rooms, Zones **cannot be set by any HomeKit bridge or accessory** — HAP has no zone characteristic at all. They can only be created by a HomeKit *controller* app acting with your permission, the same way Home.app itself does it. That's outside what this Home Assistant integration can ever do on its own, HomeKit Bridge or otherwise.
+Apple Home **Rooms** and **Zones** (e.g. grouping "Bedroom" + "Bathroom" into an "Upstairs" zone) cannot be set by any HomeKit bridge or accessory — HAP simply has no characteristic for it. We confirmed this the hard way: earlier versions of this integration wrote an `entity_config[entity_id]["room"]` key believing it would move accessories into matching Rooms, but Home Assistant's own `homekit` component has **no `"room"` key anywhere in its schema** (checked its `const.py`, `accessories.py`, `util.py`, and `__init__.py` directly — zero references). That write was a silent no-op the entire time, which is why accessories exposed by this integration keep landing in "Default Room" no matter what. Both Room and Zone placement are controller-app-only concepts in real HomeKit (`HMHome.assignAccessory`/`addRoom`/`addZone` in Apple's HomeKit framework) — only an app with your HomeKit permission can do it, the same way Home.app itself does.
 
-If you want Zones synced from HA's Floor structure (Settings → Areas, labels & zones → Floors) too, [scripts/setup_homekit_zones.py](scripts/setup_homekit_zones.py) is an optional, separate helper that runs **on your Mac** (not on the HA server). It doesn't touch HomeKit itself — it reads your Floors/Areas from HA and writes a plain `homekit_zones_setup.command` shell script (double-click in Finder to run, like any other `.command` file) that drives [HomeClaw](https://github.com/omarshahine/HomeClaw), a native macOS app with the real HomeKit framework entitlement:
+If you want Rooms and Zones set up automatically from HA's Area/Floor structure, [scripts/setup_homekit_rooms_and_zones.py](scripts/setup_homekit_rooms_and_zones.py) is an optional, separate helper that runs **on your Mac** (not on the HA server). It doesn't touch HomeKit itself — it reads your Areas/Floors from HA and writes a plain `homekit_rooms_and_zones_setup.command` shell script (double-click in Finder to run, like any other `.command` file) that drives [HomeClaw](https://github.com/omarshahine/HomeClaw), a native macOS app with the real HomeKit framework entitlement, to create a Room per Area (assigning entities into it by name) and a Zone per Floor (adding its Rooms into it):
 
 ```bash
 pip install websockets
-python3 scripts/setup_homekit_zones.py --ha-url http://homeassistant.local:8123 --ha-token <token>
-# -> writes ./homekit_zones_setup.command
+python3 scripts/setup_homekit_rooms_and_zones.py --ha-url http://homeassistant.local:8123 --ha-token <token>
+# -> writes ./homekit_rooms_and_zones_setup.command
 ```
 
-Then **open the generated file in a text editor and read it** — it's a short, plain shell script, and every `homeclaw-cli` command it will run is right there in plain sight, nothing is hidden behind Python subprocess calls. Once you're happy with it, double-click it in Finder (or run it from a terminal) to apply it.
+Then **open the generated file in a text editor and read it** — it's a short, plain shell script, and every `homeclaw-cli` command it will run is right there in plain sight, nothing is hidden behind Python subprocess calls. Preview it first (`./homekit_rooms_and_zones_setup.command --dry-run`), then run it for real once you're happy with it.
 
-Worth knowing before you run it:
+Worth knowing before you run it — all confirmed by actually running the commands below against a live HomeClaw install, not just its docs:
 
-- Requires [HomeClaw](https://github.com/omarshahine/HomeClaw) installed from the Mac App Store, with `homeclaw-cli` on your `PATH`, on the machine you generate the `.command` file on.
-- HomeClaw's documentation and release notes don't consistently agree on which room/zone-*creation* commands its CLI exposes, so the generator probes `homeclaw-cli --help` at runtime and only writes commands it can actually see advertised, rather than hard-coding guessed flags. Whatever it can't do, the generated script prints exactly what to click in Home.app instead of guessing — it deliberately does **not** attempt to simulate clicks inside Home.app itself, since that would need Accessibility permission and unverified UI selectors that could misconfigure a real accessory if wrong.
-- The most robust way to do this is actually interactive, not scripted: install HomeClaw, add its MCP server to your Claude Code / Claude Desktop config, and just ask Claude to set up your zones directly — a live agent can adapt to HomeClaw's real tool surface; this generated script can't.
+- Requires [HomeClaw](https://github.com/omarshahine/HomeClaw) installed from the Mac App Store, with `homeclaw-cli` on your `PATH`, on the machine you generate the `.command` file on. `create-room`, `create-zone`, `add-room-to-zone`, and `assign-rooms` are all real, verified subcommands — the generator also probes `homeclaw-cli --help` at runtime and only writes commands it can actually see advertised, rather than hard-coding guessed flags, since HomeClaw's own docs and release notes don't always agree with each other.
+- **`assign-rooms` needs Full Disk Access.** It reads a JSON file, and HomeClaw's CLI runs inside its own App Sandbox — in testing, it couldn't read a file from `/tmp`, `~/Desktop`, `~/Documents`, or the current directory, all with the same "you don't have permission to view it" error. If you see that, grant your terminal app Full Disk Access in System Settings → Privacy & Security → Full Disk Access and re-run it. `create-room`/`create-zone`/`add-room-to-zone` don't need this (verified working without it).
+- **`assign-rooms` matches accessories by name.** It matches each entity's current HA `friendly_name` against the accessory name HomeKit already knows. If you've renamed an accessory directly in the native HomeKit integration UI or in Home.app, the names may no longer agree and that accessory will be reported as not found — always check the `--dry-run` output for unmatched accessories. [haconnect](https://github.com/canadianblaken/ha-homekit-bridge-connect) solves this more robustly by physically actuating each device and watching for the matching state change instead of trusting names, but it's very new (no real version history yet), so it isn't the default here — worth a look if name-based matching doesn't work well for you.
+- Whatever the generated script can't do, it prints exactly what to click in Home.app instead of guessing — it deliberately does **not** attempt to simulate clicks inside Home.app itself, since that would need Accessibility permission and unverified UI selectors that could misconfigure a real accessory if wrong.
+- The most robust way to do this is actually interactive, not scripted: install HomeClaw, add its MCP server to your Claude Code / Claude Desktop config, and just ask Claude to set up your rooms/zones directly — a live agent can adapt to HomeClaw's real tool surface; this generated script can't.
 
 ### Multiple Bridges
 
@@ -144,17 +148,17 @@ You can manage **multiple HomeKit bridges inside a single HomeKit Room Sync entr
                                    ▼
                         ┌─────────────────────┐
                         │   Apple HomeKit     │
-                        │   (Updated rooms)   │
+                        │ (Updated exposure)  │
                         └─────────────────────┘
 ```
 
-### Room Assignment Priority
+### Area Resolution Priority
 
-For each entity, the room is determined in the following order:
+For each entity, the Area used to decide inclusion (and, if you also run the [Rooms and Zones script](#apple-home-rooms-and-zones-macos-only-optional), which Room it's placed into) is determined in the following order:
 
 1. **Entity's direct area**: If the entity has an area assigned directly
 2. **Device's area**: If the entity's parent device has an area assigned
-3. **No change**: If neither area is available, the room assignment is left as-is
+3. **No change**: If neither area is available, the entity isn't included by area (it can still be added via an include override)
 
 ## Important Notes
 
@@ -169,8 +173,7 @@ For each entity, the room is determined in the following order:
 ### Known Limitations
 
 - Changes may take a few seconds to appear in the Apple Home app after sync
-- Some HomeKit apps may cache room assignments; force-close and reopen the app if changes don't appear
-- Exposure is controlled by the HomeKit Bridge integration (include domains/areas). Room alignment still requires writing per-entity `entity_config` data; HomeKit does not auto-map HA areas to rooms on its own.
+- This integration only controls entity *exposure* (the HomeKit Bridge's `filter`). It cannot place entities into Apple Home Rooms or Zones — no HomeKit bridge or accessory can; see [Apple Home Rooms and Zones](#apple-home-rooms-and-zones-macos-only-optional) for the separate, optional way to do that.
 
 ## Troubleshooting
 
@@ -180,11 +183,9 @@ For each entity, the room is determined in the following order:
 2. Verify that entities are exposed to HomeKit
 3. Check the Home Assistant logs for error messages
 
-### Rooms Not Updating in Apple Home
+### Entities Stuck in "Default Room" / Showing "Continue Setup"
 
-1. Wait a few seconds for the sync to complete
-2. Force-close the Apple Home app and reopen it
-3. Try removing and re-adding the bridge in Apple Home (last resort)
+This is expected, not a bug in this integration — see [Apple Home Rooms and Zones](#apple-home-rooms-and-zones-macos-only-optional) above. "Continue Setup" is Apple Home's normal one-time prompt for any bridged accessory that's newly exposed but hasn't been individually added to the Home yet; tap through it once per new accessory.
 
 ### Enable Debug Logging
 

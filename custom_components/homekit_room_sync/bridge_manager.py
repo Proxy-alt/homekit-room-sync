@@ -12,7 +12,7 @@ from typing import Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import area_registry, device_registry, entity_registry
+from homeassistant.helpers import device_registry, entity_registry
 
 from .const import (
     CONF_AREAS,
@@ -214,24 +214,16 @@ class HomeKitBridgeManager:
 
         ent_reg = entity_registry.async_get(self._hass)
         dev_reg = device_registry.async_get(self._hass)
-        area_reg = area_registry.async_get(self._hass)
 
         area_entities = self._entities_in_areas(config, ent_reg, dev_reg)
         allowed_entities = sorted(
             (area_entities | set(config.include_entities)) - set(config.exclude_entities)
-        )
-        rooms = self._room_map_for_entities(
-            allowed_entities,
-            ent_reg,
-            dev_reg,
-            area_reg,
         )
         auto_entity_config = self._compute_auto_entity_config(config, allowed_entities, ent_reg)
 
         updated_data = self._build_updated_data(
             homekit_entry,
             allowed_entities,
-            rooms,
             auto_entity_config,
         )
         if updated_data is None:
@@ -279,26 +271,6 @@ class HomeKitBridgeManager:
             if area_id in config.areas:
                 entities.add(entry.entity_id)
         return entities
-
-    def _room_map_for_entities(
-        self,
-        entity_ids: list[str],
-        ent_reg,
-        dev_reg,
-        area_reg,
-    ) -> dict[str, str | None]:
-        rooms: dict[str, str | None] = {}
-        for entity_id in entity_ids:
-            entry = ent_reg.async_get(entity_id) if hasattr(ent_reg, "async_get") else None
-            area_id = None
-            if entry:
-                area_id = entry.area_id or self._device_area_id(dev_reg, entry.device_id)
-            if area_id:
-                area = area_reg.async_get_area(area_id)
-                rooms[entity_id] = area.name if area else None
-            else:
-                rooms[entity_id] = None
-        return rooms
 
     @staticmethod
     def _device_area_id(dev_reg, device_id: str | None) -> str | None:
@@ -381,7 +353,6 @@ class HomeKitBridgeManager:
     def _build_updated_data(
         homekit_entry: ConfigEntry,
         allowed_entities: list[str],
-        rooms: dict[str, str | None],
         auto_entity_config: dict[str, dict[str, str]],
     ) -> dict[str, object] | None:
         # ConfigEntry.data is a MappingProxyType; convert to a mutable dict before copying.
@@ -392,12 +363,19 @@ class HomeKitBridgeManager:
         }
 
         existing_entity_config = dict(new_data.get("entity_config") or {})
-        for entity_id, area_name in rooms.items():
+        for entity_id in allowed_entities:
             existing_entry = dict(existing_entity_config.get(entity_id, {}))
-            existing_entry["room"] = area_name
+            # Older versions of this integration wrote a "room" key here, but
+            # the core `homekit` component never reads it -- HomeKit Room
+            # assignment can only be set by a HomeKit controller app (e.g.
+            # HomeClaw), not a bridge. Drop any stale leftover value.
+            existing_entry.pop("room", None)
             for key, value in auto_entity_config.get(entity_id, {}).items():
                 existing_entry.setdefault(key, value)
-            existing_entity_config[entity_id] = existing_entry
+            if existing_entry:
+                existing_entity_config[entity_id] = existing_entry
+            else:
+                existing_entity_config.pop(entity_id, None)
         new_data["entity_config"] = existing_entity_config
 
         if new_data == homekit_entry.data:
