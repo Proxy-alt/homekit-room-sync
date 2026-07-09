@@ -18,29 +18,49 @@ itself does it.
 This script does NOT touch HomeKit itself. It reads your HA Area/Floor
 structure and writes a plain, readable `.command` shell script (double-click
 in Finder to run, like any other .command file) that drives HomeClaw
-(https://github.com/omarshahine/HomeClaw), a native, MIT-licensed macOS app
-with the real HomeKit framework entitlement, to:
+(https://github.com/omarshahine/HomeClaw -- see the CLI note below), a
+native, MIT-licensed macOS app with the real HomeKit framework entitlement,
+to:
   1. Create a HomeKit Room per HA Area, and assign each Area's entities
-     (matched by friendly_name) into it.
+     into it.
   2. Create a HomeKit Zone per HA Floor, and add each Floor's Areas/Rooms
      into it.
 
-HomeClaw's CLI surface has changed shape at least twice already while this
-script was being built, and its binary name isn't consistent either --
-we've seen both a flat `homeclaw-cli` (top-level `create-room`, `create-zone`,
-`add-room-to-zone`, `assign-rooms <file.json>`) and a newer grouped `homekit`
-binary (`rooms create`, `rooms assign <accessory> <room>`, `zones create`,
-`zones add-room <zone> <room>`, all gated behind an explicit
-`--allow-mutation` flag). This script detects which binary and which shape
-is actually installed at generation time and only emits commands that
-version really supports -- it does not hard-code guessed flags. The grouped
-CLI's `rooms assign` conveniently does one accessory at a time via plain
-arguments instead of a JSON file, which sidesteps a real sandboxing bug we
-hit on the older CLI (see below) for anyone running the newer version.
+Entities are matched to HomeKit accessories primarily by **HAP Serial
+Number**, not by display name. Home Assistant's own `homekit` bridge
+integration sets each exposed accessory's Serial Number characteristic
+(HAP type `00000030-0000-1000-8000-0026BB765291`) to the literal HA
+entity_id -- confirmed against live data. That's an exact, unique join key,
+unlike display names, which can drift if you've renamed an accessory
+directly in Home.app or the native HomeKit integration UI. This script
+queries HomeClaw for every accessory's Serial Number at generation time and
+resolves to the accessory's HomeKit UUID wherever it matches; it only falls
+back to matching by name for accessories where no serial-number match was
+found (e.g. ones not bridged through HA's own `homekit` integration at all).
+
+There are two separate, legitimate CLI front-ends to the same HomeClaw app,
+and it's easy to mix them up (we did, while building this):
+  - `homeclaw-cli`, the native Swift binary bundled inside
+    HomeClaw.app itself (`/Applications/HomeClaw.app/Contents/MacOS/`).
+    Flat top-level verbs: `create-room`, `create-zone`, `add-room-to-zone
+    <room> <zone>`, `assign-rooms <file.json>`.
+  - `homekit` (npm package `homekit-cli`, https://github.com/l3wi/homekit-cli),
+    a separate, third-party TypeScript CLI that talks to the same running
+    HomeClaw app over its socket/MCP interface. Grouped subcommands gated
+    behind an explicit `--allow-mutation` flag: `rooms create`, `rooms
+    assign <accessory> <room>`, `zones create`, `zones add-room <zone>
+    <room>` -- note the argument order is reversed from the native CLI's
+    `add-room-to-zone`. Install with `npm i -g homekit-cli`.
+Both are real and both work; this script detects whichever is on your PATH
+and which command shape it advertises at generation time, and only emits
+commands that one actually supports -- it does not hard-code guessed flags.
+The grouped CLI's `rooms assign` conveniently takes one accessory at a time
+via plain arguments instead of a JSON file, which sidesteps a real
+sandboxing bug the native CLI's `assign-rooms` has (see below).
 
 IMPORTANT gotchas found while verifying this against live HomeClaw installs:
 
-  - (older flat CLI only) `assign-rooms` reads a JSON file, and HomeClaw's
+  - (native `homeclaw-cli` only) `assign-rooms` reads a JSON file, and its
     CLI runs inside its own App Sandbox container
     (`com.shahine.homeclaw.cli`) -- in testing, it could not read a JSON
     file from /tmp, ~/Desktop, ~/Documents, or the current directory, all
@@ -48,24 +68,31 @@ IMPORTANT gotchas found while verifying this against live HomeClaw installs:
     that, grant your terminal app Full Disk Access in System Settings ->
     Privacy & Security -> Full Disk Access.
 
-  - Room assignment matches accessories by exact name (or HomeKit UUID). It
-    matches against each entity's current HA friendly_name -- if you've
-    renamed an accessory directly in the native HomeKit integration UI (or
-    in Home.app), the names may no longer match and that accessory will be
-    reported as not found. Always run with --dry-run first and check the
-    output for anything it couldn't match.
+  - Serial-number matching only works for accessories actually bridged
+    through HA's own `homekit` integration. Anything else (native HomeKit
+    devices, other bridges/hubs) falls back to name matching, which can
+    still miss if the accessory's HomeKit name doesn't match its HA
+    friendly_name. Always run with --dry-run first and check the output
+    for anything it couldn't match.
 
-  - This is simpler (and less robust) than a dedicated tool like haconnect
+  - Resolving every accessory's Serial Number means one extra CLI call per
+    accessory at generation time (on top of listing them) -- for a home
+    with 100+ accessories this can take a while. It's best-effort: if it
+    fails outright, generation falls back to name-only matching for
+    everything rather than aborting.
+
+  - This is simpler (and less robust for the accessories serial-number
+    matching can't resolve) than a dedicated tool like haconnect
     (https://github.com/canadianblaken/ha-homekit-bridge-connect), which
     matches HA entities to HomeKit accessories by physically actuating each
-    device and watching for the corresponding state change, rather than
-    trusting names to still agree. haconnect is very new (no version history
-    to speak of yet) so we're not defaulting to it here, but it's worth
-    knowing about if name-based matching doesn't work well for you.
+    device and watching for the corresponding state change. haconnect is
+    very new (no version history to speak of yet) so we're not defaulting
+    to it here, but it's worth knowing about if matching still doesn't work
+    well for you.
 
 Requires (macOS only, to generate the .command file):
   - HomeClaw installed from the Mac App Store, with `homekit` or
-    `homeclaw-cli` on PATH (whichever your version ships)
+    `homeclaw-cli` on PATH (see the CLI note above)
   - `pip install websockets`
   - A Home Assistant long-lived access token
     (Profile -> Security -> Long-Lived Access Tokens)
@@ -124,10 +151,10 @@ def _load_dotenv(path: Path) -> None:
 
 @dataclass
 class RoomPlan:
-    """A Room to create and the accessory names (by HA friendly_name) in it."""
+    """A Room to create and the (entity_id, friendly_name) pairs to place in it."""
 
     room_name: str
-    accessory_names: list[str] = field(default_factory=list)
+    entities: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -207,8 +234,8 @@ async def fetch_plans(ha_url: str, ha_token: str) -> tuple[list[RoomPlan], list[
             unresolved_entities.append(entity_id)
             continue
         area_name = areas_by_id[area_id]
-        room_plans.setdefault(area_name, RoomPlan(room_name=area_name)).accessory_names.append(
-            friendly_name
+        room_plans.setdefault(area_name, RoomPlan(room_name=area_name)).entities.append(
+            (entity_id, friendly_name)
         )
 
     if unresolved_entities:
@@ -284,11 +311,91 @@ def discover_top_level_commands(binary: str) -> set[str]:
     return _help_tokens(binary)
 
 
+# Standard HAP Accessory Information "Serial Number" characteristic type UUID
+# (a protocol constant, not specific to either CLI). HA's own `homekit`
+# bridge integration sets this to the literal HA entity_id.
+_SERIAL_NUMBER_CHARACTERISTIC_TYPE = "00000030-0000-1000-8000-0026BB765291"
+
+
+def _run_cli_json(binary: str, args: list[str]) -> dict | list:
+    result = subprocess.run(
+        [binary, *args], capture_output=True, text=True, timeout=30, check=False
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{binary} {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return json.loads(result.stdout)
+
+
+def discover_accessory_serial_map(binary: str, is_grouped: bool) -> dict[str, str]:
+    """Return {serial_number: accessory_uuid} for every accessory HomeClaw knows about.
+
+    Best-effort: any failure (HomeClaw not reachable, unexpected output,
+    timeout) returns {} rather than raising, so callers can fall back to
+    name-based matching for everything instead of aborting generation.
+    """
+    try:
+        if is_grouped:
+            listing = _run_cli_json(binary, ["accessories", "list", "--format", "json"])
+            accessory_ids = [a["id"] for a in listing.get("accessories", [])]
+        else:
+            listing = _run_cli_json(binary, ["list", "--json"])
+            accessory_ids = [a["id"] for a in listing]
+    except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, KeyError) as err:
+        print(
+            f"Note: couldn't list HomeKit accessories ({err}); "
+            "falling back to name-based matching for all rooms.",
+            file=sys.stderr,
+        )
+        return {}
+
+    total = len(accessory_ids)
+    print(f"Resolving {total} accessories by HomeKit serial number...")
+    serial_to_uuid: dict[str, str] = {}
+    for index, accessory_id in enumerate(accessory_ids, start=1):
+        if total > 20 and index % 20 == 0:
+            print(f"  ...{index}/{total}", file=sys.stderr)
+        try:
+            if is_grouped:
+                detail = _run_cli_json(
+                    binary, ["accessories", "get", accessory_id, "--format", "json"]
+                )
+                services = detail.get("accessory", {}).get("services", [])
+            else:
+                detail = _run_cli_json(binary, ["get", accessory_id, "--json", "--no-refresh"])
+                services = detail.get("services", [])
+        except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
+            continue
+
+        for service in services:
+            for characteristic in service.get("characteristics", []):
+                if characteristic.get("type", "").upper() == _SERIAL_NUMBER_CHARACTERISTIC_TYPE:
+                    serial = characteristic.get("value")
+                    if serial and serial != "--":
+                        serial_to_uuid[serial] = accessory_id
+                    break
+
+    print(f"  matched {len(serial_to_uuid)}/{total} accessories by serial number")
+    return serial_to_uuid
+
+
+def _resolve_identifier(
+    entity_id: str, friendly_name: str, serial_to_uuid: dict[str, str]
+) -> tuple[str, str]:
+    """Return (identifier-to-pass-to-the-CLI, human-readable label for messages)."""
+    uuid = serial_to_uuid.get(entity_id)
+    if uuid:
+        return uuid, f"{friendly_name} ({entity_id}, matched by serial number)"
+    return friendly_name, f"{friendly_name} (matched by name -- no serial-number match found)"
+
+
 def render_command_script(
     room_plans: list[RoomPlan],
     floor_plans: list[FloorPlan],
     binary: str,
     top_level_commands: set[str],
+    serial_to_uuid: dict[str, str],
 ) -> str:
     """Render a plain, readable .command shell script that applies the plans.
 
@@ -299,6 +406,10 @@ def render_command_script(
     guessed flags. Anything it can't do is printed as a manual step instead
     of simulated -- this script never clicks anything in Home.app; see the
     module docstring for why.
+
+    Each accessory is identified by its HomeKit UUID when `serial_to_uuid`
+    has a match for that entity_id (exact), falling back to its HA
+    friendly_name otherwise (best-effort; see module docstring).
     """
     is_grouped = {"rooms", "zones"} <= top_level_commands
     is_flat = {"create-room", "create-zone"} <= top_level_commands
@@ -348,12 +459,13 @@ def render_command_script(
         lines.append("")
         for plan in room_plans:
             room_q = shlex.quote(plan.room_name)
-            for accessory in plan.accessory_names:
-                acc_q = shlex.quote(accessory)
-                fail_msg = echo(f"  failed: {accessory} -> {plan.room_name}", stderr=True)
+            for entity_id, friendly_name in plan.entities:
+                identifier, label = _resolve_identifier(entity_id, friendly_name, serial_to_uuid)
+                identifier_q = shlex.quote(identifier)
+                fail_msg = echo(f"  failed: {label} -> {plan.room_name}", stderr=True)
                 lines.append(
-                    f"{binary} rooms assign {acc_q} {room_q} --allow-mutation $DRY_RUN_FLAG "
-                    f"|| {{ {fail_msg}; failures=$((failures+1)); }}"
+                    f"{binary} rooms assign {identifier_q} {room_q} --allow-mutation "
+                    f"$DRY_RUN_FLAG || {{ {fail_msg}; failures=$((failures+1)); }}"
                 )
     elif is_flat:
         for plan in room_plans:
@@ -366,11 +478,14 @@ def render_command_script(
         lines.append("")
 
         if room_plans:
-            assignments = [
-                {"accessory": name, "room": plan.room_name}
-                for plan in room_plans
-                for name in plan.accessory_names
-            ]
+            assignments = []
+            for plan in room_plans:
+                for entity_id, friendly_name in plan.entities:
+                    uuid = serial_to_uuid.get(entity_id)
+                    if uuid:
+                        assignments.append({"uuid": uuid, "room": plan.room_name})
+                    else:
+                        assignments.append({"accessory": friendly_name, "room": plan.room_name})
             assignments_json = json.dumps(assignments, indent=2)
             permission_hint_1 = echo(
                 "  assign-rooms could not read its own JSON file -- HomeClaw's CLI is sandboxed.",
@@ -509,7 +624,7 @@ async def main() -> int:
 
     print("\nPlanned rooms:")
     for plan in room_plans:
-        print(f"  {plan.room_name}: {', '.join(plan.accessory_names)}")
+        print(f"  {plan.room_name}: {', '.join(name for _, name in plan.entities)}")
     print("\nPlanned zones:")
     for plan in floor_plans:
         print(f"  {plan.zone_name}: {', '.join(plan.room_names)}")
@@ -521,7 +636,13 @@ async def main() -> int:
         print(f"\n{err}", file=sys.stderr)
         return 1
 
-    script_text = render_command_script(room_plans, floor_plans, binary, top_level_commands)
+    is_grouped = {"rooms", "zones"} <= top_level_commands
+    print()
+    serial_to_uuid = discover_accessory_serial_map(binary, is_grouped)
+
+    script_text = render_command_script(
+        room_plans, floor_plans, binary, top_level_commands, serial_to_uuid
+    )
     args.output.write_text(script_text)
     args.output.chmod(0o755)
 
