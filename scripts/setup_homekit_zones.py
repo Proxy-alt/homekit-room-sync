@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create HomeKit Zones matching Home Assistant Floors (macOS only).
+"""Generate a .command file that sets up Apple Home Zones via HomeClaw.
 
 homekit_room_sync already syncs each HA Area to a HomeKit *Room* over HAP
 (the HomeKit Accessory Protocol). Apple Home *Zones* (e.g. "Upstairs") are a
@@ -8,28 +8,37 @@ accessory, including this integration, can ever set one. Zones can only be
 created by a HomeKit *controller* app acting with the user's HomeKit
 permission (the same way Home.app itself does it).
 
-This script drives HomeClaw (https://github.com/omarshahine/HomeClaw), a
-native, MIT-licensed macOS app with the real HomeKit framework entitlement,
-to do that part: for each HA Floor, create a matching HomeKit Zone and put
-the Rooms (HA Areas) on that floor into it.
+This script does NOT touch HomeKit itself. It reads your HA Floor/Area
+structure and writes a plain, readable `.command` shell script (double-click
+in Finder to run, like any other .command file) that drives HomeClaw
+(https://github.com/omarshahine/HomeClaw), a native, MIT-licensed macOS app
+with the real HomeKit framework entitlement, to create a matching Zone per
+Floor and put each Floor's Rooms (HA Areas) into it.
 
-IMPORTANT — read before running:
+Splitting it this way means you can actually read every command before
+anything runs, instead of trusting a Python script's internal subprocess
+calls against your live smart home.
+
+IMPORTANT — read before running the generated file:
 
   HomeClaw's own documentation and release notes disagree about which
   room/zone-*creation* commands its CLI actually exposes (as of the version
   available when this script was written, only room *re-assignment* to
   already-existing rooms was confirmed in the changelog). Rather than
   hard-code guessed flags that might just fail silently, this script probes
-  `homeclaw-cli --help` at runtime and only calls commands it can actually
-  see advertised there. If HomeClaw can't do a step, this script tells you
-  exactly what to click in Home.app instead of guessing.
+  `homeclaw-cli --help` (on the machine generating the file) and only writes
+  commands it can actually see advertised there. Whatever it can't do is
+  written into the generated script as a printed manual step (plus opening
+  Home.app), not simulated -- clicking blindly through Home.app's UI would
+  need Accessibility permission and unverified UI selectors that could
+  misconfigure a real accessory if wrong.
 
   The most robust way to do this today is actually interactive: install
   HomeClaw, add its MCP server to your Claude Code / Claude Desktop config,
   and ask Claude directly to set up your zones. A live agent can adapt to
-  whatever HomeClaw's real tool surface is; this script can't.
+  whatever HomeClaw's real tool surface is; this generated script can't.
 
-Requires (macOS only):
+Requires (macOS only, to generate the .command file):
   - HomeClaw installed from the Mac App Store, with `homeclaw-cli` on PATH
   - `pip install websockets`
   - A Home Assistant long-lived access token
@@ -37,19 +46,14 @@ Requires (macOS only):
 
 Usage:
   python3 scripts/setup_homekit_zones.py --ha-url http://homeassistant.local:8123 \\
-      --ha-token <token>                     # dry run: prints the plan only
-  python3 scripts/setup_homekit_zones.py ... --apply                # applies it
-  python3 scripts/setup_homekit_zones.py ... --apply --ui-fallback  # + guided
-                                                                     #   manual
-                                                                     #   assist
-                                                                     #   for
-                                                                     #   whatever
-                                                                     #   HomeClaw
-                                                                     #   couldn't
-                                                                     #   do
+      --ha-token <token>
+  # -> writes ./homekit_zones_setup.command
+  # Review it, then double-click in Finder (or `./homekit_zones_setup.command`)
+  # to actually apply it.
 
 HA_URL and HA_TOKEN can also be set via environment variables or a `.env`
-file (see env.example).
+file (see env.example). Use --output/-o to change where the .command file
+is written.
 """
 
 from __future__ import annotations
@@ -58,10 +62,12 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -173,24 +179,14 @@ def discover_homeclaw_commands() -> set[str]:
     return tokens
 
 
-def _run_homeclaw(*args: str, dry_run: bool) -> bool:
-    command = ["homeclaw-cli", *args]
-    print(f"  $ {' '.join(command)}")
-    if dry_run:
-        return True
-    result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
-    if result.returncode != 0:
-        print(f"    failed: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
-        return False
-    return True
+def render_command_script(plans: list[FloorPlan], available_commands: set[str]) -> str:
+    """Render a plain, readable .command shell script that applies `plans`.
 
-
-def apply_via_homeclaw(
-    plans: list[FloorPlan], available_commands: set[str], dry_run: bool
-) -> list[FloorPlan]:
-    """Attempt each step only via commands homeclaw-cli actually advertises.
-
-    Returns the plans (or partial plans) that could NOT be completed this way.
+    Only ever emits homeclaw-cli commands that were actually seen in its
+    `--help` output. Anything it can't do is written as a printed manual
+    step (plus opening Home.app at the end) rather than simulated -- this
+    script never clicks anything in Home.app itself; see the module
+    docstring for why.
     """
     zone_create_cmd = next(
         (c for c in ("create-zone", "add-zone") if c in available_commands), None
@@ -199,68 +195,80 @@ def apply_via_homeclaw(
         (c for c in ("add-room-to-zone", "assign-room-to-zone") if c in available_commands), None
     )
 
-    if zone_create_cmd is None and room_assign_cmd is None:
-        print(
-            "homeclaw-cli doesn't advertise a zone-creation or room-assignment "
-            "command in this version (checked --help output). Skipping "
-            "automated steps entirely for all floors.",
-            file=sys.stderr,
-        )
-        return plans
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    lines: list[str] = [
+        "#!/bin/bash",
+        f"# Generated by scripts/setup_homekit_zones.py on {generated_at}",
+        "# Creates Apple Home Zones matching your Home Assistant Floors, via HomeClaw.",
+        "# Every command below is exactly what will run -- review before double-clicking.",
+        "set -uo pipefail",
+        "",
+        "if ! command -v homeclaw-cli >/dev/null 2>&1; then",
+        '  echo "homeclaw-cli not found on PATH. Install HomeClaw from the Mac App Store:" >&2',
+        '  echo "  https://apps.apple.com/us/app/homeclaw/id6759682551" >&2',
+        "  exit 1",
+        "fi",
+        "",
+        "failures=0",
+        "manual_needed=0",
+        "",
+    ]
 
-    remaining: list[FloorPlan] = []
+    def echo(message: str, *, stderr: bool = False) -> str:
+        # Always single-quote via shlex.quote so bash never re-interprets
+        # $(...), backticks, or $VAR inside a Floor/Area name pulled from HA.
+        redirect = " >&2" if stderr else ""
+        return f"echo {shlex.quote(message)}{redirect}"
+
     for plan in plans:
-        print(f"\nZone: {plan.zone_name}")
-        zone_ok = True
+        zone = shlex.quote(plan.zone_name)
+        lines.append(echo(f"== Zone: {plan.zone_name} =="))
         if zone_create_cmd:
-            zone_ok = _run_homeclaw(zone_create_cmd, plan.zone_name, dry_run=dry_run)
+            fail_msg = echo(
+                f"  could not create zone {plan.zone_name} "
+                "(homeclaw-cli reported an error -- it may already exist)"
+            )
+            lines.append(f"homeclaw-cli {zone_create_cmd} {zone} || {fail_msg}")
         else:
-            print("  (no known zone-creation command; assuming zone already exists)")
+            lines.append(
+                echo(
+                    f'  (no zone-creation command available; assuming "{plan.zone_name}" already exists)'
+                )
+            )
 
-        unassigned_rooms: list[str] = []
         if room_assign_cmd:
             for room in plan.room_names:
-                ok = _run_homeclaw(room_assign_cmd, room, plan.zone_name, dry_run=dry_run)
-                if not ok:
-                    unassigned_rooms.append(room)
+                room_q = shlex.quote(room)
+                fail_msg = echo(f"  failed: {room} -> {plan.zone_name}", stderr=True)
+                lines.append(
+                    f"homeclaw-cli {room_assign_cmd} {room_q} {zone} "
+                    f"|| {{ {fail_msg}; failures=$((failures+1)); }}"
+                )
         else:
-            unassigned_rooms = list(plan.room_names)
+            for room in plan.room_names:
+                lines.append(
+                    echo(
+                        f'  MANUAL: add room "{room}" to zone "{plan.zone_name}" '
+                        "(no homeclaw-cli command available for this)"
+                    )
+                )
+            lines.append("manual_needed=$((manual_needed+1))")
+        lines.append("")
 
-        if not zone_ok or unassigned_rooms:
-            remaining.append(FloorPlan(zone_name=plan.zone_name, room_names=unassigned_rooms))
-
-    return remaining
-
-
-def guided_manual_fallback(remaining: list[FloorPlan]) -> None:
-    """Bring Home.app to the front and print exact manual steps.
-
-    Deliberately does NOT attempt to simulate clicks inside Home.app: doing
-    so via System Events requires Accessibility permission this script can't
-    verify is safe, and the exact UI layout/labels have not been validated
-    against a live Home.app session. A wrong click in Home.app can rename or
-    remove real accessories, so this prints a checklist instead of guessing.
-    """
-    if not remaining:
-        return
-
-    print(
-        "\nHomeClaw couldn't complete the following automatically. "
-        "Opening Home.app -- finish these by hand:\n"
-    )
-    for plan in remaining:
-        print(f'  Zone "{plan.zone_name}":')
-        print(
-            '    Home.app -> Rooms tab -> "+" -> "Add Zone..." -> name it '
-            f'"{plan.zone_name}" if it does not already exist.'
-        )
-        for room in plan.room_names:
-            print(
-                f'    Then add Room "{room}" to that zone (long-press the room, "Assign to Zone").'
-            )
-        print()
-
-    subprocess.run(["osascript", "-e", 'tell application "Home" to activate'], check=False)
+    lines += [
+        'if [ "$failures" -gt 0 ] || [ "$manual_needed" -gt 0 ]; then',
+        '  echo ""',
+        '  echo "Some steps need manual follow-up. In Home.app:"',
+        '  echo \'  Rooms tab -> "+" -> "Add Zone..." to create a zone if it is missing.\'',
+        "  echo '  Long-press a room -> \"Assign to Zone\" to add it to a zone.'",
+        "  open -a Home",
+        "fi",
+        "",
+        'echo ""',
+        'echo "Done. $failures command failure(s), $manual_needed zone(s) needing manual setup."',
+        "",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 async def main() -> int:
@@ -274,12 +282,11 @@ async def main() -> int:
         "--ha-token", default=os.environ.get("HA_TOKEN"), help="HA long-lived access token"
     )
     parser.add_argument(
-        "--apply", action="store_true", help="Actually run the commands (default: dry run)"
-    )
-    parser.add_argument(
-        "--ui-fallback",
-        action="store_true",
-        help="Print manual steps (and bring Home.app to front) for anything HomeClaw couldn't do",
+        "--output",
+        "-o",
+        type=Path,
+        default=Path.cwd() / "homekit_zones_setup.command",
+        help="Where to write the generated .command file (default: ./homekit_zones_setup.command)",
     )
     args = parser.parse_args()
 
@@ -302,7 +309,7 @@ async def main() -> int:
         print("Set up Floors in HA: Settings -> Areas, labels & zones -> Floors.")
         return 0
 
-    print(f"\nPlanned zones ({'DRY RUN' if not args.apply else 'APPLYING'}):")
+    print("\nPlanned zones:")
     for plan in plans:
         print(f"  {plan.zone_name}: {', '.join(plan.room_names)}")
 
@@ -310,19 +317,15 @@ async def main() -> int:
         available = discover_homeclaw_commands()
     except RuntimeError as err:
         print(f"\n{err}", file=sys.stderr)
-        if args.ui_fallback:
-            guided_manual_fallback(plans)
         return 1
 
-    remaining = apply_via_homeclaw(plans, available, dry_run=not args.apply)
+    script_text = render_command_script(plans, available)
+    args.output.write_text(script_text)
+    args.output.chmod(0o755)
 
-    if args.ui_fallback and args.apply:
-        guided_manual_fallback(remaining)
-    elif remaining and args.apply:
-        print(
-            f"\n{len(remaining)} zone(s) need manual follow-up. Re-run with "
-            "--ui-fallback to get exact steps, or finish them in Home.app yourself."
-        )
+    print(f"\nWrote {args.output}")
+    print("Review it -- it's a plain shell script, every command it will run is right there.")
+    print(f"Then double-click it in Finder, or run: {args.output}")
 
     return 0
 

@@ -96,19 +96,21 @@ This is **additive only** — it never overwrites a value you (or the native Hom
 
 Apple Home "Zones" (e.g. grouping "Bedroom" + "Bathroom" into "Upstairs") are one level above Rooms. Unlike Rooms, Zones **cannot be set by any HomeKit bridge or accessory** — HAP has no zone characteristic at all. They can only be created by a HomeKit *controller* app acting with your permission, the same way Home.app itself does it. That's outside what this Home Assistant integration can ever do on its own, HomeKit Bridge or otherwise.
 
-If you want Zones synced from HA's Floor structure (Settings → Areas, labels & zones → Floors) too, [scripts/setup_homekit_zones.py](scripts/setup_homekit_zones.py) is an optional, separate helper that runs **on your Mac** (not on the HA server) and drives [HomeClaw](https://github.com/omarshahine/HomeClaw), a native macOS app with the real HomeKit framework entitlement:
+If you want Zones synced from HA's Floor structure (Settings → Areas, labels & zones → Floors) too, [scripts/setup_homekit_zones.py](scripts/setup_homekit_zones.py) is an optional, separate helper that runs **on your Mac** (not on the HA server). It doesn't touch HomeKit itself — it reads your Floors/Areas from HA and writes a plain `homekit_zones_setup.command` shell script (double-click in Finder to run, like any other `.command` file) that drives [HomeClaw](https://github.com/omarshahine/HomeClaw), a native macOS app with the real HomeKit framework entitlement:
 
 ```bash
 pip install websockets
-python3 scripts/setup_homekit_zones.py --ha-url http://homeassistant.local:8123 --ha-token <token>   # dry run
-python3 scripts/setup_homekit_zones.py ... --apply                                                   # applies it
+python3 scripts/setup_homekit_zones.py --ha-url http://homeassistant.local:8123 --ha-token <token>
+# -> writes ./homekit_zones_setup.command
 ```
+
+Then **open the generated file in a text editor and read it** — it's a short, plain shell script, and every `homeclaw-cli` command it will run is right there in plain sight, nothing is hidden behind Python subprocess calls. Once you're happy with it, double-click it in Finder (or run it from a terminal) to apply it.
 
 Worth knowing before you run it:
 
-- Requires [HomeClaw](https://github.com/omarshahine/HomeClaw) installed from the Mac App Store, with `homeclaw-cli` on your `PATH`.
-- HomeClaw's documentation and release notes don't consistently agree on which room/zone-*creation* commands its CLI exposes, so this script probes `homeclaw-cli --help` at runtime and only calls commands it can actually see advertised, rather than hard-coding guessed flags. Whatever it can't do, it tells you exactly what to click in Home.app instead of guessing — it deliberately does **not** attempt to simulate clicks inside Home.app itself, since that would need Accessibility permission and unverified UI selectors that could misconfigure a real accessory if wrong.
-- The most robust way to do this is actually interactive, not scripted: install HomeClaw, add its MCP server to your Claude Code / Claude Desktop config, and just ask Claude to set up your zones directly — a live agent can adapt to HomeClaw's real tool surface; this static script can't.
+- Requires [HomeClaw](https://github.com/omarshahine/HomeClaw) installed from the Mac App Store, with `homeclaw-cli` on your `PATH`, on the machine you generate the `.command` file on.
+- HomeClaw's documentation and release notes don't consistently agree on which room/zone-*creation* commands its CLI exposes, so the generator probes `homeclaw-cli --help` at runtime and only writes commands it can actually see advertised, rather than hard-coding guessed flags. Whatever it can't do, the generated script prints exactly what to click in Home.app instead of guessing — it deliberately does **not** attempt to simulate clicks inside Home.app itself, since that would need Accessibility permission and unverified UI selectors that could misconfigure a real accessory if wrong.
+- The most robust way to do this is actually interactive, not scripted: install HomeClaw, add its MCP server to your Claude Code / Claude Desktop config, and just ask Claude to set up your zones directly — a live agent can adapt to HomeClaw's real tool surface; this generated script can't.
 
 ### Multiple Bridges
 
