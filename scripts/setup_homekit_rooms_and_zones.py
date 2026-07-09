@@ -25,22 +25,30 @@ with the real HomeKit framework entitlement, to:
   2. Create a HomeKit Zone per HA Floor, and add each Floor's Areas/Rooms
      into it.
 
-All of the commands below were verified against a real, installed HomeClaw
-CLI (`homeclaw-cli --help` / `homeclaw-cli help <subcommand>`), not just its
-docs -- which elsewhere in this project turned out to disagree with its own
-release notes. `create-room`, `create-zone`, `add-room-to-zone`, and
-`assign-rooms` are all real, confirmed subcommands.
+HomeClaw's CLI surface has changed shape at least twice already while this
+script was being built, and its binary name isn't consistent either --
+we've seen both a flat `homeclaw-cli` (top-level `create-room`, `create-zone`,
+`add-room-to-zone`, `assign-rooms <file.json>`) and a newer grouped `homekit`
+binary (`rooms create`, `rooms assign <accessory> <room>`, `zones create`,
+`zones add-room <zone> <room>`, all gated behind an explicit
+`--allow-mutation` flag). This script detects which binary and which shape
+is actually installed at generation time and only emits commands that
+version really supports -- it does not hard-code guessed flags. The grouped
+CLI's `rooms assign` conveniently does one accessory at a time via plain
+arguments instead of a JSON file, which sidesteps a real sandboxing bug we
+hit on the older CLI (see below) for anyone running the newer version.
 
-IMPORTANT gotchas found while verifying this against a live HomeClaw install:
+IMPORTANT gotchas found while verifying this against live HomeClaw installs:
 
-  - `assign-rooms` reads a JSON file, and HomeClaw's CLI runs inside its own
-    App Sandbox container (`com.shahine.homeclaw.cli`) -- in testing, it
-    could not read a JSON file from /tmp, ~/Desktop, ~/Documents, or the
-    current directory, all with the same "you don't have permission to view
-    it" error. If you hit that, grant your terminal app Full Disk Access in
-    System Settings -> Privacy & Security -> Full Disk Access.
+  - (older flat CLI only) `assign-rooms` reads a JSON file, and HomeClaw's
+    CLI runs inside its own App Sandbox container
+    (`com.shahine.homeclaw.cli`) -- in testing, it could not read a JSON
+    file from /tmp, ~/Desktop, ~/Documents, or the current directory, all
+    with the same "you don't have permission to view it" error. If you hit
+    that, grant your terminal app Full Disk Access in System Settings ->
+    Privacy & Security -> Full Disk Access.
 
-  - `assign-rooms` matches accessories by exact name (or HomeKit UUID). It
+  - Room assignment matches accessories by exact name (or HomeKit UUID). It
     matches against each entity's current HA friendly_name -- if you've
     renamed an accessory directly in the native HomeKit integration UI (or
     in Home.app), the names may no longer match and that accessory will be
@@ -56,7 +64,8 @@ IMPORTANT gotchas found while verifying this against a live HomeClaw install:
     knowing about if name-based matching doesn't work well for you.
 
 Requires (macOS only, to generate the .command file):
-  - HomeClaw installed from the Mac App Store, with `homeclaw-cli` on PATH
+  - HomeClaw installed from the Mac App Store, with `homekit` or
+    `homeclaw-cli` on PATH (whichever your version ships)
   - `pip install websockets`
   - A Home Assistant long-lived access token
     (Profile -> Security -> Long-Lived Access Tokens)
@@ -237,15 +246,24 @@ async def fetch_plans(ha_url: str, ha_token: str) -> tuple[list[RoomPlan], list[
     )
 
 
-def discover_homeclaw_commands() -> set[str]:
-    """Return the set of subcommand-looking tokens homeclaw-cli advertises."""
-    if shutil.which("homeclaw-cli") is None:
-        raise RuntimeError(
-            "homeclaw-cli not found on PATH. Install HomeClaw from the Mac App "
-            "Store first: https://apps.apple.com/us/app/homeclaw/id6759682551"
-        )
+_CLI_BINARY_CANDIDATES = ("homekit", "homeclaw-cli")
+
+
+def discover_cli_binary() -> str:
+    """Return whichever HomeClaw CLI binary name is actually on PATH."""
+    for candidate in _CLI_BINARY_CANDIDATES:
+        if shutil.which(candidate):
+            return candidate
+    raise RuntimeError(
+        "Neither 'homekit' nor 'homeclaw-cli' found on PATH. Install HomeClaw "
+        "from the Mac App Store first: https://apps.apple.com/us/app/homeclaw/id6759682551"
+    )
+
+
+def _help_tokens(binary: str, *args: str) -> set[str]:
+    """Return subcommand-looking first-words from `<binary> <args> --help`."""
     result = subprocess.run(
-        ["homeclaw-cli", "--help"],
+        [binary, *args, "--help"],
         capture_output=True,
         text=True,
         timeout=10,
@@ -261,26 +279,29 @@ def discover_homeclaw_commands() -> set[str]:
     return tokens
 
 
+def discover_top_level_commands(binary: str) -> set[str]:
+    """Return the set of subcommand-looking tokens the CLI advertises at its top level."""
+    return _help_tokens(binary)
+
+
 def render_command_script(
     room_plans: list[RoomPlan],
     floor_plans: list[FloorPlan],
-    available_commands: set[str],
+    binary: str,
+    top_level_commands: set[str],
 ) -> str:
     """Render a plain, readable .command shell script that applies the plans.
 
-    Only ever emits homeclaw-cli commands that were actually seen in its
-    `--help` output. Anything it can't do is printed as a manual step
-    instead of simulated -- this script never clicks anything in Home.app;
-    see the module docstring for why.
+    Detects which HomeClaw CLI generation is installed -- the newer grouped
+    `rooms`/`zones` subcommands (gated behind --allow-mutation) or the older
+    flat top-level verbs -- from `top_level_commands`, and only emits
+    commands that generation actually supports; it does not hard-code
+    guessed flags. Anything it can't do is printed as a manual step instead
+    of simulated -- this script never clicks anything in Home.app; see the
+    module docstring for why.
     """
-    create_room_cmd = "create-room" if "create-room" in available_commands else None
-    assign_rooms_cmd = "assign-rooms" if "assign-rooms" in available_commands else None
-    zone_create_cmd = next(
-        (c for c in ("create-zone", "add-zone") if c in available_commands), None
-    )
-    room_assign_cmd = next(
-        (c for c in ("add-room-to-zone", "assign-room-to-zone") if c in available_commands), None
-    )
+    is_grouped = {"rooms", "zones"} <= top_level_commands
+    is_flat = {"create-room", "create-zone"} <= top_level_commands
 
     def echo(message: str, *, stderr: bool = False) -> str:
         # Always single-quote via shlex.quote so bash never re-interprets
@@ -304,8 +325,8 @@ def render_command_script(
         f"  {echo('Running in --dry-run mode: previewing only, nothing will change.')}",
         "fi",
         "",
-        "if ! command -v homeclaw-cli >/dev/null 2>&1; then",
-        '  echo "homeclaw-cli not found on PATH. Install HomeClaw from the Mac App Store:" >&2',
+        f"if ! command -v {binary} >/dev/null 2>&1; then",
+        f'  echo "{binary} not found on PATH. Install HomeClaw from the Mac App Store:" >&2',
         '  echo "  https://apps.apple.com/us/app/homeclaw/id6759682551" >&2',
         "  exit 1",
         "fi",
@@ -317,93 +338,107 @@ def render_command_script(
 
     # --- Rooms ---
     lines.append(echo("== Rooms =="))
-    if create_room_cmd:
+    if is_grouped:
+        for plan in room_plans:
+            room_q = shlex.quote(plan.room_name)
+            fail_msg = echo(f"  could not create room {plan.room_name} (may already exist)")
+            lines.append(
+                f"{binary} rooms create {room_q} --allow-mutation $DRY_RUN_FLAG || {fail_msg}"
+            )
+        lines.append("")
+        for plan in room_plans:
+            room_q = shlex.quote(plan.room_name)
+            for accessory in plan.accessory_names:
+                acc_q = shlex.quote(accessory)
+                fail_msg = echo(f"  failed: {accessory} -> {plan.room_name}", stderr=True)
+                lines.append(
+                    f"{binary} rooms assign {acc_q} {room_q} --allow-mutation $DRY_RUN_FLAG "
+                    f"|| {{ {fail_msg}; failures=$((failures+1)); }}"
+                )
+    elif is_flat:
         for plan in room_plans:
             room_q = shlex.quote(plan.room_name)
             fail_msg = echo(
                 f"  could not create room {plan.room_name} "
                 "(homeclaw-cli reported an error -- it may already exist)"
             )
-            lines.append(f"homeclaw-cli {create_room_cmd} {room_q} $DRY_RUN_FLAG || {fail_msg}")
+            lines.append(f"{binary} create-room {room_q} $DRY_RUN_FLAG || {fail_msg}")
+        lines.append("")
+
+        if room_plans:
+            assignments = [
+                {"accessory": name, "room": plan.room_name}
+                for plan in room_plans
+                for name in plan.accessory_names
+            ]
+            assignments_json = json.dumps(assignments, indent=2)
+            permission_hint_1 = echo(
+                "  assign-rooms could not read its own JSON file -- HomeClaw's CLI is sandboxed.",
+                stderr=True,
+            )
+            permission_hint_2 = echo(
+                "  Grant Full Disk Access to your terminal app in System Settings -> "
+                "Privacy & Security -> Full Disk Access, then re-run this.",
+                stderr=True,
+            )
+            lines += [
+                "ASSIGN_FILE=$(mktemp -t homekit_room_assignments).json",
+                "cat > \"$ASSIGN_FILE\" <<'HOMEKIT_ROOM_ASSIGNMENTS_EOF'",
+                assignments_json,
+                "HOMEKIT_ROOM_ASSIGNMENTS_EOF",
+                f'ASSIGN_OUTPUT=$({binary} assign-rooms "$ASSIGN_FILE" $DRY_RUN_FLAG 2>&1)',
+                "ASSIGN_STATUS=$?",
+                'echo "$ASSIGN_OUTPUT"',
+                'if [ "$ASSIGN_STATUS" -ne 0 ]; then',
+                "  failures=$((failures+1))",
+                '  if echo "$ASSIGN_OUTPUT" | grep -qi "permission to view"; then',
+                f"    {permission_hint_1}",
+                f"    {permission_hint_2}",
+                "  fi",
+                "fi",
+                'rm -f "$ASSIGN_FILE"',
+            ]
     else:
         lines.append(
             echo(
-                "  no create-room command available in this homeclaw-cli version; "
-                "create rooms manually in Home.app first"
+                "  unrecognized homeclaw CLI version; create rooms and assign "
+                "accessories manually in Home.app"
             )
         )
         lines.append("manual_needed=$((manual_needed+1))")
     lines.append("")
-
-    if assign_rooms_cmd and room_plans:
-        assignments = [
-            {"accessory": name, "room": plan.room_name}
-            for plan in room_plans
-            for name in plan.accessory_names
-        ]
-        assignments_json = json.dumps(assignments, indent=2)
-        permission_hint_1 = echo(
-            "  assign-rooms could not read its own JSON file -- HomeClaw's CLI is sandboxed.",
-            stderr=True,
-        )
-        permission_hint_2 = echo(
-            "  Grant Full Disk Access to your terminal app in System Settings -> "
-            "Privacy & Security -> Full Disk Access, then re-run this.",
-            stderr=True,
-        )
-        lines += [
-            "ASSIGN_FILE=$(mktemp -t homekit_room_assignments).json",
-            "cat > \"$ASSIGN_FILE\" <<'HOMEKIT_ROOM_ASSIGNMENTS_EOF'",
-            assignments_json,
-            "HOMEKIT_ROOM_ASSIGNMENTS_EOF",
-            f'ASSIGN_OUTPUT=$(homeclaw-cli {assign_rooms_cmd} "$ASSIGN_FILE" $DRY_RUN_FLAG 2>&1)',
-            "ASSIGN_STATUS=$?",
-            'echo "$ASSIGN_OUTPUT"',
-            'if [ "$ASSIGN_STATUS" -ne 0 ]; then',
-            "  failures=$((failures+1))",
-            '  if echo "$ASSIGN_OUTPUT" | grep -qi "permission to view"; then',
-            f"    {permission_hint_1}",
-            f"    {permission_hint_2}",
-            "  fi",
-            "fi",
-            'rm -f "$ASSIGN_FILE"',
-            "",
-        ]
-    elif room_plans:
-        lines.append(
-            echo(
-                "  no assign-rooms command available in this homeclaw-cli version; "
-                "assign accessories to rooms manually in Home.app"
-            )
-        )
-        lines.append("manual_needed=$((manual_needed+1))")
-        lines.append("")
 
     # --- Zones ---
     lines.append(echo("== Zones =="))
     for plan in floor_plans:
         zone = shlex.quote(plan.zone_name)
         lines.append(echo(f"-- Zone: {plan.zone_name} --"))
-        if zone_create_cmd:
+        if is_grouped:
+            fail_msg = echo(f"  could not create zone {plan.zone_name} (may already exist)")
+            lines.append(
+                f"{binary} zones create {zone} --allow-mutation $DRY_RUN_FLAG || {fail_msg}"
+            )
+            for room in plan.room_names:
+                room_q = shlex.quote(room)
+                fail_msg = echo(f"  failed: {room} -> {plan.zone_name}", stderr=True)
+                # Argument order for this CLI generation is zone, then room.
+                lines.append(
+                    f"{binary} zones add-room {zone} {room_q} --allow-mutation $DRY_RUN_FLAG "
+                    f"|| {{ {fail_msg}; failures=$((failures+1)); }}"
+                )
+        elif is_flat:
             fail_msg = echo(
                 f"  could not create zone {plan.zone_name} "
                 "(homeclaw-cli reported an error -- it may already exist)"
             )
-            lines.append(f"homeclaw-cli {zone_create_cmd} {zone} $DRY_RUN_FLAG || {fail_msg}")
-        else:
-            lines.append(
-                echo(
-                    f'  (no zone-creation command available; assuming "{plan.zone_name}" '
-                    "already exists)"
-                )
-            )
-
-        if room_assign_cmd:
+            lines.append(f"{binary} create-zone {zone} $DRY_RUN_FLAG || {fail_msg}")
             for room in plan.room_names:
                 room_q = shlex.quote(room)
                 fail_msg = echo(f"  failed: {room} -> {plan.zone_name}", stderr=True)
+                # Argument order for this (older) CLI generation is room, then zone --
+                # the opposite of the grouped CLI's `zones add-room <zone> <room>`.
                 lines.append(
-                    f"homeclaw-cli {room_assign_cmd} {room_q} {zone} $DRY_RUN_FLAG "
+                    f"{binary} add-room-to-zone {room_q} {zone} $DRY_RUN_FLAG "
                     f"|| {{ {fail_msg}; failures=$((failures+1)); }}"
                 )
         else:
@@ -411,7 +446,7 @@ def render_command_script(
                 lines.append(
                     echo(
                         f'  MANUAL: add room "{room}" to zone "{plan.zone_name}" '
-                        "(no homeclaw-cli command available for this)"
+                        "(unrecognized homeclaw CLI version)"
                     )
                 )
             lines.append("manual_needed=$((manual_needed+1))")
@@ -480,12 +515,13 @@ async def main() -> int:
         print(f"  {plan.zone_name}: {', '.join(plan.room_names)}")
 
     try:
-        available = discover_homeclaw_commands()
+        binary = discover_cli_binary()
+        top_level_commands = discover_top_level_commands(binary)
     except RuntimeError as err:
         print(f"\n{err}", file=sys.stderr)
         return 1
 
-    script_text = render_command_script(room_plans, floor_plans, available)
+    script_text = render_command_script(room_plans, floor_plans, binary, top_level_commands)
     args.output.write_text(script_text)
     args.output.chmod(0o755)
 
