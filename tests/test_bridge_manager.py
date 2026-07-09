@@ -16,6 +16,28 @@ from custom_components.homekit_room_sync.bridge_manager import (
 from custom_components.homekit_room_sync.const import CONF_BRIDGES, HOMEKIT_DOMAIN
 
 
+def _mock_entry(
+    entity_id: str,
+    area_id: str | None = None,
+    device_id: str | None = None,
+    device_class: str | None = None,
+) -> MagicMock:
+    entry = MagicMock()
+    entry.entity_id = entity_id
+    entry.area_id = area_id
+    entry.device_id = device_id
+    entry.device_class = device_class
+    entry.original_device_class = None
+    return entry
+
+
+def _entity_registry(entity_map: dict[str, MagicMock]) -> MagicMock:
+    registry = MagicMock()
+    registry.entities = entity_map
+    registry.async_get = lambda entity_id: entity_map.get(entity_id)
+    return registry
+
+
 @pytest.mark.asyncio
 async def test_manager_updates_homekit_entry(
     mock_hass: MagicMock,
@@ -104,6 +126,263 @@ async def test_manager_respects_manual_overrides(
     assert updated_entities == ["light.living_room", "sensor.unknown"]
     entity_config = update_kwargs["data"]["entity_config"]
     assert entity_config["sensor.unknown"]["room"] is None
+
+
+@pytest.mark.asyncio
+async def test_manager_preserves_existing_name_override(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_entity_registry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_area_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """Syncing rooms should not clobber a user's HomeKit name override."""
+    mock_homekit_entry.data = {
+        "filter": {},
+        "entity_config": {
+            "light.living_room": {"name": "Custom Lamp Name"},
+        },
+    }
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=mock_entity_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
+            return_value=mock_area_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
+    assert entity_config["name"] == "Custom Lamp Name"
+    assert entity_config["room"] == "Living Room"
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_links_battery_sensor(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_area_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """A same-device battery sensor should be auto-linked in entity_config."""
+    ent_reg = _entity_registry(
+        {
+            "light.living_room": _mock_entry(
+                "light.living_room", area_id="area_living_room", device_id="device_light"
+            ),
+            "sensor.living_room_battery": _mock_entry(
+                "sensor.living_room_battery", device_id="device_light", device_class="battery"
+            ),
+        }
+    )
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=ent_reg,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
+            return_value=mock_area_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
+    assert entity_config["linked_battery_sensor"] == "sensor.living_room_battery"
+    # The sibling battery sensor itself is a diagnostic entity, not exposed.
+    assert "sensor.living_room_battery" not in update_kwargs["data"]["filter"]["include_entities"]
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_link_does_not_override_manual_value(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_area_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """A manually-configured linked sensor should win over auto-detection."""
+    mock_homekit_entry.data = {
+        "filter": {},
+        "entity_config": {
+            "light.living_room": {"linked_battery_sensor": "sensor.custom_battery"},
+        },
+    }
+    ent_reg = _entity_registry(
+        {
+            "light.living_room": _mock_entry(
+                "light.living_room", area_id="area_living_room", device_id="device_light"
+            ),
+            "sensor.living_room_battery": _mock_entry(
+                "sensor.living_room_battery", device_id="device_light", device_class="battery"
+            ),
+        }
+    )
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=ent_reg,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
+            return_value=mock_area_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
+    assert entity_config["linked_battery_sensor"] == "sensor.custom_battery"
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_link_disabled(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_area_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """link_related_sensors=False should skip auto-linking entirely."""
+    ent_reg = _entity_registry(
+        {
+            "light.living_room": _mock_entry(
+                "light.living_room", area_id="area_living_room", device_id="device_light"
+            ),
+            "sensor.living_room_battery": _mock_entry(
+                "sensor.living_room_battery", device_id="device_light", device_class="battery"
+            ),
+        }
+    )
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+        link_related_sensors=False,
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=ent_reg,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
+            return_value=mock_area_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]["light.living_room"]
+    assert "linked_battery_sensor" not in entity_config
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_detects_outlet_switch_type(
+    mock_hass: MagicMock,
+    mock_config_entry: MagicMock,
+    mock_device_registry: MagicMock,
+    mock_area_registry: MagicMock,
+    mock_homekit_entry: MagicMock,
+) -> None:
+    """A switch entity with device_class 'outlet' should get type: outlet."""
+    ent_reg = _entity_registry(
+        {
+            "switch.plug": _mock_entry(
+                "switch.plug",
+                area_id="area_living_room",
+                device_id="device_plug",
+                device_class="outlet",
+            ),
+        }
+    )
+
+    config = BridgeConfig(
+        entry_id=mock_homekit_entry.entry_id,
+        areas=frozenset({"area_living_room"}),
+        include_entities=frozenset(),
+        exclude_entities=frozenset(),
+    )
+    manager = HomeKitBridgeManager(mock_hass, mock_config_entry, [config])
+
+    with (
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.entity_registry.async_get",
+            return_value=ent_reg,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.device_registry.async_get",
+            return_value=mock_device_registry,
+        ),
+        patch(
+            "custom_components.homekit_room_sync.bridge_manager.area_registry.async_get",
+            return_value=mock_area_registry,
+        ),
+    ):
+        result = await manager.async_sync()
+
+    assert result is True
+    update_kwargs = mock_hass.config_entries.async_update_entry.call_args[1]
+    entity_config = update_kwargs["data"]["entity_config"]["switch.plug"]
+    assert entity_config["type"] == "outlet"
 
 
 def test_as_str_set_converts_non_strings() -> None:

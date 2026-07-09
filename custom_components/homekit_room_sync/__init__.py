@@ -20,12 +20,12 @@ from .bridge_manager import HomeKitBridgeManager, parse_bridge_configs
 from .const import (
     ATTR_BRIDGE_ID,
     ATTR_ENTRY_ID,
-    CONF_AREAS,
     CONF_ALLOWED_AREAS,
-    CONF_BRIDGES,
+    CONF_AREAS,
     CONF_BRIDGE_ID,
     CONF_BRIDGE_NAME,
     CONF_BRIDGE_TITLE,
+    CONF_BRIDGES,
     CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
@@ -161,26 +161,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await manager.async_sync()
 
         # Schedule new sync with debounce delay
-        entry_data["debounce_cancel"] = async_call_later(
-            hass, SYNC_DEBOUNCE_DELAY, perform_sync
-        )
+        entry_data["debounce_cancel"] = async_call_later(hass, SYNC_DEBOUNCE_DELAY, perform_sync)
 
     # Register event listeners
     listeners: list[UnsubscribeCallback] = []
 
     # Listen for entity registry updates
-    listeners.append(
-        hass.bus.async_listen(EVENT_ENTITY_REGISTRY_UPDATED, schedule_sync)
-    )
+    listeners.append(hass.bus.async_listen(EVENT_ENTITY_REGISTRY_UPDATED, schedule_sync))
     _LOGGER.debug("Registered listener for %s", EVENT_ENTITY_REGISTRY_UPDATED)
 
     # Listen for area registry updates
     listeners.append(hass.bus.async_listen(EVENT_AREA_REGISTRY_UPDATED, schedule_sync))
     _LOGGER.debug("Registered listener for %s", EVENT_AREA_REGISTRY_UPDATED)
 
-    listeners.append(
-        hass.bus.async_listen(EVENT_DEVICE_REGISTRY_UPDATED, schedule_sync)
-    )
+    listeners.append(hass.bus.async_listen(EVENT_DEVICE_REGISTRY_UPDATED, schedule_sync))
     _LOGGER.debug("Registered listener for %s", EVENT_DEVICE_REGISTRY_UPDATED)
 
     # Store listeners for cleanup
@@ -270,9 +264,7 @@ async def _migrate_v2_to_v3(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     homekit_entries = hass.config_entries.async_entries(HOMEKIT_DOMAIN)
     lookup_by_id = {hk.entry_id: hk.entry_id for hk in homekit_entries}
-    lookup_by_title = {
-        (hk.title or "").strip(): hk.entry_id for hk in homekit_entries if hk.title
-    }
+    lookup_by_title = {(hk.title or "").strip(): hk.entry_id for hk in homekit_entries if hk.title}
     lookup_by_name = {
         str(hk.data.get("name")).strip(): hk.entry_id
         for hk in homekit_entries
@@ -295,10 +287,7 @@ async def _migrate_v2_to_v3(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not isinstance(raw, dict):
             continue
         identifier = str(
-            raw.get(CONF_BRIDGE_ID)
-            or raw.get(CONF_BRIDGE_TITLE)
-            or raw.get(CONF_BRIDGE_NAME)
-            or ""
+            raw.get(CONF_BRIDGE_ID) or raw.get(CONF_BRIDGE_TITLE) or raw.get(CONF_BRIDGE_NAME) or ""
         ).strip()
         resolved = resolve_entry_id(identifier)
         if not resolved:

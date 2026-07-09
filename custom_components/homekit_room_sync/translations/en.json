@@ -14,7 +14,8 @@
         "data": {
           "areas": "Areas to include",
           "include_entities": "Include entity overrides",
-          "exclude_entities": "Exclude entity overrides"
+          "exclude_entities": "Exclude entity overrides",
+          "link_related_sensors": "Auto-link related sensors (battery, motion, humidity, etc.)"
         }
       }
     },
@@ -42,7 +43,8 @@
         "data": {
           "areas": "Areas to include",
           "include_entities": "Include entity overrides",
-          "exclude_entities": "Exclude entity overrides"
+          "exclude_entities": "Exclude entity overrides",
+          "link_related_sensors": "Auto-link related sensors (battery, motion, humidity, etc.)"
         }
       }
     }

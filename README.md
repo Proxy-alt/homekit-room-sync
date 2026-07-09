@@ -70,6 +70,45 @@ Once configured, the integration works automatically in the background.
 | **Areas** | Limit syncing to entities assigned to the selected Home Assistant Areas |
 | **Include entity overrides** | Always expose these entities, even if they are not in the allowed Areas |
 | **Exclude entity overrides** | Never expose these entities, even if they would otherwise match |
+| **Auto-link related sensors** | Automatically wire up battery/motion/humidity/etc. sensors for richer HomeKit accessory cards (see below). Enabled by default; can be disabled per bridge. |
+
+### Auto-Linked Sensors
+
+Home Assistant's HomeKit Bridge integration supports several `entity_config` options that make accessories show richer info in Apple Home (battery percentage, motion-triggered doorbell alerts, humidity/PM2.5 readings, filter maintenance) — but nothing wires them up automatically; normally you'd hand-edit `configuration.yaml` per entity.
+
+When **Auto-link related sensors** is enabled, HomeKit Room Sync looks for sibling entities on the same Home Assistant *device* as each exposed entity and links them in automatically:
+
+| Exposed entity | Auto-linked sibling (same device) | HomeKit effect |
+|---|---|---|
+| any entity | `sensor` with `device_class: battery` | Battery percentage shown on the accessory tile |
+| any entity | `binary_sensor` with `device_class: battery_charging` | Charging indicator |
+| `humidifier` | `sensor` with `device_class: humidity` | Current humidity reading |
+| `fan` (air purifier) | `sensor` with `device_class: temperature` / `pm25` | Temperature / air quality readings |
+| `camera`, `lock` | `binary_sensor` with `device_class: motion` | Motion-triggered notifications |
+| `camera`, `lock` | `event` with `device_class: doorbell` | Doorbell press notifications |
+| `switch` with `device_class: outlet` | *(itself)* | Exposed as a HomeKit **Outlet** instead of a generic switch |
+
+This is **additive only** — it never overwrites a value you (or the native HomeKit integration options UI) already set for that entity, and it never removes a link once made, even if the sibling entity later disappears. To reset a stale link, clear it manually via the HomeKit Bridge integration's own entity options.
+
+**Known gaps we can't close from here:** this add-on only edits the HomeKit Bridge's `filter`/`entity_config`, so it can't add capabilities that require new HAP accessory categories. Two examples from Apple's recent HomeKit work that fall outside that scope: HomeKit's Robot Vacuum Cleaner category (added in iOS 18.4) — Home Assistant's `homekit` integration still exposes `vacuum` entities as plain switches, not real vacuum accessories — and HomeKit Secure Video, which isn't implemented by the HomeKit Bridge integration at all. Fixing either would mean patching Home Assistant core's `homekit` component itself. Apple Home "Zones" have a similar issue and are covered separately below.
+
+### Apple Home Zones (macOS only, optional)
+
+Apple Home "Zones" (e.g. grouping "Bedroom" + "Bathroom" into "Upstairs") are one level above Rooms. Unlike Rooms, Zones **cannot be set by any HomeKit bridge or accessory** — HAP has no zone characteristic at all. They can only be created by a HomeKit *controller* app acting with your permission, the same way Home.app itself does it. That's outside what this Home Assistant integration can ever do on its own, HomeKit Bridge or otherwise.
+
+If you want Zones synced from HA's Floor structure (Settings → Areas, labels & zones → Floors) too, [scripts/setup_homekit_zones.py](scripts/setup_homekit_zones.py) is an optional, separate helper that runs **on your Mac** (not on the HA server) and drives [HomeClaw](https://github.com/omarshahine/HomeClaw), a native macOS app with the real HomeKit framework entitlement:
+
+```bash
+pip install websockets
+python3 scripts/setup_homekit_zones.py --ha-url http://homeassistant.local:8123 --ha-token <token>   # dry run
+python3 scripts/setup_homekit_zones.py ... --apply                                                   # applies it
+```
+
+Worth knowing before you run it:
+
+- Requires [HomeClaw](https://github.com/omarshahine/HomeClaw) installed from the Mac App Store, with `homeclaw-cli` on your `PATH`.
+- HomeClaw's documentation and release notes don't consistently agree on which room/zone-*creation* commands its CLI exposes, so this script probes `homeclaw-cli --help` at runtime and only calls commands it can actually see advertised, rather than hard-coding guessed flags. Whatever it can't do, it tells you exactly what to click in Home.app instead of guessing — it deliberately does **not** attempt to simulate clicks inside Home.app itself, since that would need Accessibility permission and unverified UI selectors that could misconfigure a real accessory if wrong.
+- The most robust way to do this is actually interactive, not scripted: install HomeClaw, add its MCP server to your Claude Code / Claude Desktop config, and just ask Claude to set up your zones directly — a live agent can adapt to HomeClaw's real tool surface; this static script can't.
 
 ### Multiple Bridges
 

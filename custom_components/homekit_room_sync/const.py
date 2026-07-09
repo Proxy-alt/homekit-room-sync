@@ -10,6 +10,20 @@ CONF_ENTRY_ID: Final = "entry_id"
 CONF_AREAS: Final = "areas"
 CONF_INCLUDE_ENTITIES: Final = "include_entities"
 CONF_EXCLUDE_ENTITIES: Final = "exclude_entities"
+CONF_LINK_RELATED_SENSORS: Final = "link_related_sensors"
+
+# HomeKit Bridge entity_config keys this integration can auto-populate.
+# These mirror homeassistant.components.homekit.const so we write values the
+# core `homekit` integration already understands without requiring users to
+# hand-edit YAML for them.
+CONF_LINKED_BATTERY_SENSOR: Final = "linked_battery_sensor"
+CONF_LINKED_BATTERY_CHARGING_SENSOR: Final = "linked_battery_charging_sensor"
+CONF_LINKED_HUMIDITY_SENSOR: Final = "linked_humidity_sensor"
+CONF_LINKED_TEMPERATURE_SENSOR: Final = "linked_temperature_sensor"
+CONF_LINKED_PM25_SENSOR: Final = "linked_pm25_sensor"
+CONF_LINKED_MOTION_SENSOR: Final = "linked_motion_sensor"
+CONF_LINKED_DOORBELL_SENSOR: Final = "linked_doorbell_sensor"
+CONF_ENTITY_TYPE: Final = "type"
 
 # Legacy keys retained for migration only
 CONF_BRIDGE_NAME: Final = "bridge_name"

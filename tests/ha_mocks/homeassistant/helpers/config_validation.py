@@ -20,3 +20,16 @@ def multi_select(_options: dict[str, str] | None = None):  # noqa: D401
         raise vol.Invalid("Invalid multi_select value")
 
     return validate
+
+
+def boolean(value: object) -> bool:
+    """Mimic homeassistant.helpers.config_validation.boolean."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.lower() in ("1", "true", "yes", "on", "enable"):
+            return True
+        if value.lower() in ("0", "false", "no", "off", "disable"):
+            return False
+        raise vol.Invalid(f"invalid boolean value {value!r}")
+    raise vol.Invalid(f"invalid boolean value {value!r}")

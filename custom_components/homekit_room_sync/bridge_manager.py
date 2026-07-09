@@ -6,8 +6,9 @@ import asyncio
 import copy
 import logging
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Final, Iterable
+from typing import Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -16,9 +17,18 @@ from homeassistant.helpers import area_registry, device_registry, entity_registr
 from .const import (
     CONF_AREAS,
     CONF_BRIDGES,
+    CONF_ENTITY_TYPE,
     CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
+    CONF_LINK_RELATED_SENSORS,
+    CONF_LINKED_BATTERY_CHARGING_SENSOR,
+    CONF_LINKED_BATTERY_SENSOR,
+    CONF_LINKED_DOORBELL_SENSOR,
+    CONF_LINKED_HUMIDITY_SENSOR,
+    CONF_LINKED_MOTION_SENSOR,
+    CONF_LINKED_PM25_SENSOR,
+    CONF_LINKED_TEMPERATURE_SENSOR,
     HOMEKIT_DOMAIN,
 )
 
@@ -26,6 +36,23 @@ _LOGGER = logging.getLogger(__name__)
 
 _PORT_RANGE_START: Final = 20000
 _PORT_RANGE_SIZE: Final = 30000
+
+# Sibling-sensor auto-linking rules: a target entity gets `config_key` set to
+# a same-device sibling entity when one exists matching (sibling_domain,
+# device_class). `target_domains=None` means the rule applies to any target
+# domain (e.g. battery level/charging is meaningful for almost any accessory).
+# These mirror homeassistant.components.homekit's entity_config options so
+# HomeKit surfaces (battery %, filter/AQI cards, motion-triggered doorbell
+# notifications) work without the user hand-editing YAML.
+_LINKED_SENSOR_RULES: Final[tuple[tuple[frozenset[str] | None, str, str, str], ...]] = (
+    (None, "sensor", "battery", CONF_LINKED_BATTERY_SENSOR),
+    (None, "binary_sensor", "battery_charging", CONF_LINKED_BATTERY_CHARGING_SENSOR),
+    (frozenset({"humidifier"}), "sensor", "humidity", CONF_LINKED_HUMIDITY_SENSOR),
+    (frozenset({"fan"}), "sensor", "temperature", CONF_LINKED_TEMPERATURE_SENSOR),
+    (frozenset({"fan"}), "sensor", "pm25", CONF_LINKED_PM25_SENSOR),
+    (frozenset({"camera", "lock"}), "binary_sensor", "motion", CONF_LINKED_MOTION_SENSOR),
+    (frozenset({"camera", "lock"}), "event", "doorbell", CONF_LINKED_DOORBELL_SENSOR),
+)
 
 
 def _preferred_port(entry_id: str) -> int:
@@ -65,6 +92,7 @@ class BridgeConfig:
     areas: frozenset[str]
     include_entities: frozenset[str]
     exclude_entities: frozenset[str]
+    link_related_sensors: bool = True
 
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> BridgeConfig | None:
@@ -77,6 +105,7 @@ class BridgeConfig:
             areas=frozenset(_as_str_set(raw.get(CONF_AREAS))),
             include_entities=frozenset(_as_str_set(raw.get(CONF_INCLUDE_ENTITIES))),
             exclude_entities=frozenset(_as_str_set(raw.get(CONF_EXCLUDE_ENTITIES))),
+            link_related_sensors=bool(raw.get(CONF_LINK_RELATED_SENSORS, True)),
         )
 
     def serialize(self) -> dict[str, object]:
@@ -86,6 +115,7 @@ class BridgeConfig:
             CONF_AREAS: sorted(self.areas),
             CONF_INCLUDE_ENTITIES: sorted(self.include_entities),
             CONF_EXCLUDE_ENTITIES: sorted(self.exclude_entities),
+            CONF_LINK_RELATED_SENSORS: self.link_related_sensors,
         }
 
 
@@ -145,15 +175,11 @@ class HomeKitBridgeManager:
             return False
 
         targets = (
-            [self._configs[bridge_entry_id]]
-            if bridge_entry_id
-            else list(self._configs.values())
+            [self._configs[bridge_entry_id]] if bridge_entry_id else list(self._configs.values())
         )
 
         if not targets:
-            _LOGGER.debug(
-                "No HomeKit bridges configured for %s", self._entry.entry_id
-            )
+            _LOGGER.debug("No HomeKit bridges configured for %s", self._entry.entry_id)
             return True
 
         results = await asyncio.gather(
@@ -200,11 +226,13 @@ class HomeKitBridgeManager:
             dev_reg,
             area_reg,
         )
+        auto_entity_config = self._compute_auto_entity_config(config, allowed_entities, ent_reg)
 
         updated_data = self._build_updated_data(
             homekit_entry,
             allowed_entities,
             rooms,
+            auto_entity_config,
         )
         if updated_data is None:
             # No filter/entity updates, but we still might need to adjust the port.
@@ -279,11 +307,82 @@ class HomeKitBridgeManager:
         device = dev_reg.async_get(device_id)
         return device.area_id if device else None
 
+    def _compute_auto_entity_config(
+        self,
+        config: BridgeConfig,
+        allowed_entities: list[str],
+        ent_reg,
+    ) -> dict[str, dict[str, str]]:
+        """Auto-detect linked sensors/type overrides from same-device siblings.
+
+        Only ever *proposes* values; `_build_updated_data` merges them in
+        additively so a value the user already set (manually, or via the
+        native HomeKit integration UI) always wins.
+        """
+        if not config.link_related_sensors or not hasattr(ent_reg, "async_get"):
+            return {}
+
+        entries = getattr(ent_reg, "entities", {})
+        if not entries:
+            return {}
+
+        siblings_by_device: dict[str, list] = {}
+        for entry in entries.values():
+            if entry.device_id:
+                siblings_by_device.setdefault(entry.device_id, []).append(entry)
+
+        auto_config: dict[str, dict[str, str]] = {}
+        for entity_id in allowed_entities:
+            target_entry = ent_reg.async_get(entity_id)
+            if target_entry is None or not target_entry.device_id:
+                continue
+
+            domain = entity_id.split(".", 1)[0]
+            siblings = siblings_by_device.get(target_entry.device_id, [])
+            overrides: dict[str, str] = {}
+
+            for target_domains, sibling_domain, device_class, config_key in _LINKED_SENSOR_RULES:
+                if target_domains is not None and domain not in target_domains:
+                    continue
+                match = self._find_sibling(siblings, entity_id, sibling_domain, device_class)
+                if match:
+                    overrides[config_key] = match
+
+            if domain == "switch" and self._device_class(target_entry) == "outlet":
+                overrides[CONF_ENTITY_TYPE] = "outlet"
+
+            if overrides:
+                auto_config[entity_id] = overrides
+
+        return auto_config
+
+    @staticmethod
+    def _device_class(entry) -> str | None:
+        return getattr(entry, "device_class", None) or getattr(entry, "original_device_class", None)
+
+    @classmethod
+    def _find_sibling(
+        cls,
+        siblings: list,
+        exclude_entity_id: str,
+        sibling_domain: str,
+        device_class: str,
+    ) -> str | None:
+        matches = sorted(
+            sibling.entity_id
+            for sibling in siblings
+            if sibling.entity_id != exclude_entity_id
+            and sibling.entity_id.split(".", 1)[0] == sibling_domain
+            and cls._device_class(sibling) == device_class
+        )
+        return matches[0] if matches else None
+
     @staticmethod
     def _build_updated_data(
         homekit_entry: ConfigEntry,
         allowed_entities: list[str],
         rooms: dict[str, str | None],
+        auto_entity_config: dict[str, dict[str, str]],
     ) -> dict[str, object] | None:
         # ConfigEntry.data is a MappingProxyType; convert to a mutable dict before copying.
         new_data = copy.deepcopy(dict(homekit_entry.data))
@@ -294,9 +393,10 @@ class HomeKitBridgeManager:
 
         existing_entity_config = dict(new_data.get("entity_config") or {})
         for entity_id, area_name in rooms.items():
-            existing_entry = existing_entity_config.get(entity_id, {})
-            existing_entry["name"] = None
+            existing_entry = dict(existing_entity_config.get(entity_id, {}))
             existing_entry["room"] = area_name
+            for key, value in auto_entity_config.get(entity_id, {}).items():
+                existing_entry.setdefault(key, value)
             existing_entity_config[entity_id] = existing_entry
         new_data["entity_config"] = existing_entity_config
 
@@ -334,9 +434,7 @@ class HomeKitBridgeManager:
             return False
 
         used_ports = {
-            port
-            for entry_id, port in port_map.items()
-            if entry_id != homekit_entry.entry_id
+            port for entry_id, port in port_map.items() if entry_id != homekit_entry.entry_id
         }
         replacement = _pick_new_port(homekit_entry.entry_id, used_ports)
         if replacement is None:

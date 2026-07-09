@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import (
@@ -13,7 +14,8 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.core import callback
-from homeassistant.helpers import area_registry, config_validation as cv
+from homeassistant.helpers import area_registry
+from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CONF_AREAS,
@@ -21,6 +23,7 @@ from .const import (
     CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
+    CONF_LINK_RELATED_SENSORS,
     DOMAIN,
     HOMEKIT_DOMAIN,
 )
@@ -32,10 +35,7 @@ def _parse_entity_text(value: Any) -> list[str]:
     """Normalize user-entered entity lists."""
     if value is None:
         return []
-    if isinstance(value, list):
-        source = ",".join(str(item) for item in value)
-    else:
-        source = str(value)
+    source = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
     parts = {part.strip() for part in source.replace("\n", ",").split(",")}
     return sorted(part for part in parts if part)
 
@@ -99,6 +99,7 @@ class BridgeFlowMixin:
 
         include_defaults = _list_to_text(defaults.get(CONF_INCLUDE_ENTITIES, []))
         exclude_defaults = _list_to_text(defaults.get(CONF_EXCLUDE_ENTITIES, []))
+        link_related_sensors_default = defaults.get(CONF_LINK_RELATED_SENSORS, True)
 
         return vol.Schema(
             {
@@ -114,6 +115,10 @@ class BridgeFlowMixin:
                     CONF_EXCLUDE_ENTITIES,
                     default=exclude_defaults,
                 ): str,
+                vol.Optional(
+                    CONF_LINK_RELATED_SENSORS,
+                    default=link_related_sensors_default,
+                ): cv.boolean,
             }
         )
 
@@ -123,13 +128,7 @@ class BridgeFlowMixin:
         user_input: dict[str, Any],
     ) -> dict[str, Any]:
         allowed_keys = user_input.get(CONF_AREAS) or []
-        allowed_ids = sorted(
-            {
-                self._area_id_lookup.get(key, key)
-                for key in allowed_keys
-                if key
-            }
-        )
+        allowed_ids = sorted({self._area_id_lookup.get(key, key) for key in allowed_keys if key})
 
         include_entities = _parse_entity_text(user_input.get(CONF_INCLUDE_ENTITIES))
         include_set = set(include_entities)
@@ -144,6 +143,7 @@ class BridgeFlowMixin:
             CONF_AREAS: allowed_ids,
             CONF_INCLUDE_ENTITIES: include_entities,
             CONF_EXCLUDE_ENTITIES: exclude_entities,
+            CONF_LINK_RELATED_SENSORS: bool(user_input.get(CONF_LINK_RELATED_SENSORS, True)),
         }
 
     async def _async_handle_bridge_step(
@@ -185,9 +185,7 @@ class BridgeFlowMixin:
         raise NotImplementedError
 
 
-class HomeKitRoomSyncConfigFlow(
-    BridgeFlowMixin, ConfigFlow, domain=DOMAIN
-):  # type: ignore[call-arg]
+class HomeKitRoomSyncConfigFlow(BridgeFlowMixin, ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg]
     """Handle a config flow for HomeKit Room Sync."""
 
     VERSION = 3
@@ -204,9 +202,7 @@ class HomeKitRoomSyncConfigFlow(
     def _discover_homekit_bridges(self) -> dict[str, str]:
         entries = self.hass.config_entries.async_entries(HOMEKIT_DOMAIN)
         return {
-            entry.entry_id: entry.title
-            or entry.data.get("name")
-            or entry.entry_id
+            entry.entry_id: entry.title or entry.data.get("name") or entry.entry_id
             for entry in entries
         }
 
@@ -224,14 +220,11 @@ class HomeKitRoomSyncConfigFlow(
             managed.get(CONF_ENTRY_ID)
             for entry in self._async_current_entries()
             for managed in entry.data.get(CONF_BRIDGES, [])
-            if isinstance(managed, dict)
-            and isinstance(managed.get(CONF_ENTRY_ID), str)
+            if isinstance(managed, dict) and isinstance(managed.get(CONF_ENTRY_ID), str)
         }
 
         available = {
-            entry_id: name
-            for entry_id, name in discovered.items()
-            if entry_id not in configured
+            entry_id: name for entry_id, name in discovered.items() if entry_id not in configured
         }
 
         if not available:
@@ -297,9 +290,7 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
     def _discover_homekit_bridges(self) -> dict[str, str]:
         entries = self.hass.config_entries.async_entries(HOMEKIT_DOMAIN)
         return {
-            entry.entry_id: entry.title
-            or entry.data.get("name")
-            or entry.entry_id
+            entry.entry_id: entry.title or entry.data.get("name") or entry.entry_id
             for entry in entries
         }
 
@@ -354,9 +345,7 @@ class HomeKitRoomSyncOptionsFlow(BridgeFlowMixin, OptionsFlow):
                 self._selected_bridge_ids = selected
                 self._bridge_payloads = []
                 self._bridge_form_index = 0
-                self._existing_bridge_map = {
-                    cfg.get(CONF_ENTRY_ID): cfg for cfg in current_configs
-                }
+                self._existing_bridge_map = {cfg.get(CONF_ENTRY_ID): cfg for cfg in current_configs}
                 return await self.async_step_bridge()
 
         schema = vol.Schema(

@@ -16,6 +16,7 @@ from custom_components.homekit_room_sync.const import (
     CONF_ENTRY_ID,
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
+    CONF_LINK_RELATED_SENSORS,
 )
 
 
@@ -111,6 +112,39 @@ async def test_bridge_step_creates_entry(
     assert data[CONF_INCLUDE_ENTITIES] == ["light.kitchen", "switch.desk"]
     # Exclude should remove duplicates present in include
     assert data[CONF_EXCLUDE_ENTITIES] == ["sensor.outdoor"]
+    # Sensor auto-linking defaults on when not explicitly provided
+    assert data[CONF_LINK_RELATED_SENSORS] is True
+
+
+@pytest.mark.asyncio
+async def test_bridge_step_respects_link_related_sensors_toggle(
+    flow: HomeKitRoomSyncConfigFlow,
+    mock_area_registry: MagicMock,
+) -> None:
+    """Users should be able to opt out of sibling-sensor auto-linking."""
+    flow._async_current_entries = MagicMock(return_value=[])
+
+    with patch(
+        "custom_components.homekit_room_sync.config_flow.HomeKitRoomSyncConfigFlow._discover_homekit_bridges",
+        return_value={"bridge1": "Bridge 1"},
+    ):
+        await flow.async_step_user({CONF_BRIDGES: ["bridge1"]})
+
+    with patch(
+        "custom_components.homekit_room_sync.config_flow.area_registry.async_get",
+        return_value=mock_area_registry,
+    ):
+        result = await flow.async_step_bridge(
+            {
+                CONF_AREAS: ["area_living_room"],
+                CONF_INCLUDE_ENTITIES: "",
+                CONF_EXCLUDE_ENTITIES: "",
+                CONF_LINK_RELATED_SENSORS: False,
+            }
+        )
+
+    data = result["data"][CONF_BRIDGES][0]
+    assert data[CONF_LINK_RELATED_SENSORS] is False
 
 
 @pytest.mark.asyncio
