@@ -68,12 +68,22 @@ IMPORTANT gotchas found while verifying this against live HomeClaw installs:
     that, grant your terminal app Full Disk Access in System Settings ->
     Privacy & Security -> Full Disk Access.
 
-  - Serial-number matching only works for accessories actually bridged
-    through HA's own `homekit` integration. Anything else (native HomeKit
-    devices, other bridges/hubs) falls back to name matching, which can
-    still miss if the accessory's HomeKit name doesn't match its HA
-    friendly_name. Always run with --dry-run first and check the output
-    for anything it couldn't match.
+  - Serial-number matching works for any accessory HA's own `homekit`
+    integration created -- including ones HAP requires to run as their own
+    standalone accessory rather than as part of the shared multi-accessory
+    bridge (cameras, locks, TVs/media players). Don't confuse that
+    structural distinction with "not connected to HA": we initially assumed
+    a `"bridged": false` accessory meant it wasn't HA-managed, and were
+    wrong -- verified live that a real lock reporting `bridged: false` still
+    had its Serial Number set to its HA entity_id, because HAP's
+    bridged-vs-standalone-accessory distinction is unrelated to which
+    software created it. Serial-number matching only fails for accessories
+    genuinely paired directly to Apple Home by their own manufacturer,
+    completely outside HA (e.g. a lock's own native HomeKit pairing, if you
+    have one alongside its HA integration). Those fall back to name
+    matching, which can still miss if the accessory's HomeKit name doesn't
+    match its HA friendly_name. Always run with --dry-run first and check
+    the output for anything it couldn't match.
 
   - Resolving every accessory's Serial Number means one extra CLI call per
     accessory at generation time (on top of listing them) -- for a home
@@ -339,6 +349,17 @@ def _run_cli_json(binary: str, args: list[str]) -> dict | list:
 def discover_accessory_info(binary: str, is_grouped: bool) -> dict[str, AccessoryInfo]:
     """Return {serial_number: AccessoryInfo} for every accessory HomeClaw knows about.
 
+    Always does a *live* per-accessory read, deliberately not the native
+    CLI's `--no-refresh` (cached) mode despite its own help text describing
+    that as "ideal for serial number ... sweeps". Verified live against a
+    real accessory that this is wrong: a lock's Serial Number characteristic
+    read as the placeholder "--" under --no-refresh (because HomeClaw had
+    never done a live read of that specific characteristic before) and only
+    showed its real value -- a genuine HA entity_id -- once read live. A
+    live sweep of ~130 real accessories took under a minute (~0.3s/accessory
+    vs ~0.03s cached); that's a one-time cost worth paying over silently
+    missing real serial-number matches.
+
     Best-effort: any failure (HomeClaw not reachable, unexpected output,
     timeout) returns {} rather than raising, so callers can fall back to
     name-based matching for everything instead of aborting generation.
@@ -359,7 +380,7 @@ def discover_accessory_info(binary: str, is_grouped: bool) -> dict[str, Accessor
         return {}
 
     total = len(accessory_ids)
-    print(f"Resolving {total} accessories by HomeKit serial number...")
+    print(f"Resolving {total} accessories by HomeKit serial number (live reads, may take a bit)...")
     serial_to_info: dict[str, AccessoryInfo] = {}
     for index, accessory_id in enumerate(accessory_ids, start=1):
         if total > 20 and index % 20 == 0:
@@ -371,7 +392,7 @@ def discover_accessory_info(binary: str, is_grouped: bool) -> dict[str, Accessor
                 )
                 accessory = detail.get("accessory", {})
             else:
-                accessory = _run_cli_json(binary, ["get", accessory_id, "--json", "--no-refresh"])
+                accessory = _run_cli_json(binary, ["get", accessory_id, "--json"])
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
             continue
 
