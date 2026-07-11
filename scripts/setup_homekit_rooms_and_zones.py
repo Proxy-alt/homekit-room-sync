@@ -187,7 +187,18 @@ async def fetch_plans(ha_url: str, ha_token: str) -> tuple[list[RoomPlan], list[
     `config/device_registry/list`, and `get_states`.
 
     Mirrors the exact same area-resolution rule the homekit_room_sync
-    integration itself uses: an entity's own area, else its device's area.
+    integration itself uses: an entity's own area, else its device's area --
+    plus one addition specific to this script: HA "Group" helper entities
+    (e.g. a Light Group combining several individual lights, exposed to
+    HomeKit as one accessory) have no device of their own to inherit an area
+    from, so they'd otherwise be silently skipped and never room-assigned
+    even though HA's homekit bridge exposes them just like any other
+    entity (confirmed live: a "light.basement_stairs" group accessory had
+    its Serial Number correctly set to that entity_id, but was never placed
+    in the right HomeKit room because nothing upstream could tell it where
+    it belonged). If every member of the group agrees on one area, that
+    becomes the group's area too; if members span more than one area, we
+    can't safely guess, so it's left unresolved same as before.
     """
     normalized = ha_url.rstrip("/")
     if normalized.startswith("https://"):
@@ -232,13 +243,41 @@ async def fetch_plans(ha_url: str, ha_token: str) -> tuple[list[RoomPlan], list[
     friendly_name_by_entity = {
         state["entity_id"]: state.get("attributes", {}).get("friendly_name") for state in states
     }
+    entities_by_id = {entity["entity_id"]: entity for entity in entities}
+    # HA's built-in Group helpers (light/switch/cover/fan/media_player groups)
+    # all list their member entity_ids the same way: an "entity_id" list in
+    # the group entity's own state attributes.
+    group_members_by_entity = {
+        state["entity_id"]: state["attributes"]["entity_id"]
+        for state in states
+        if isinstance(state.get("attributes", {}).get("entity_id"), list)
+    }
+
+    def _own_area_id(entity: dict) -> str | None:
+        return entity.get("area_id") or device_area_by_id.get(entity.get("device_id"))
+
+    def _resolve_area_id(entity_id: str, entity: dict) -> str | None:
+        area_id = _own_area_id(entity)
+        if area_id:
+            return area_id
+        member_ids = group_members_by_entity.get(entity_id)
+        if not member_ids:
+            return None
+        member_areas = set()
+        for member_id in member_ids:
+            member_entity = entities_by_id.get(member_id)
+            if member_entity:
+                member_area = _own_area_id(member_entity)
+                if member_area:
+                    member_areas.add(member_area)
+        return next(iter(member_areas)) if len(member_areas) == 1 else None
 
     room_plans: dict[str, RoomPlan] = {}
     unresolved_entities: list[str] = []
 
     for entity in entities:
         entity_id = entity["entity_id"]
-        area_id = entity.get("area_id") or device_area_by_id.get(entity.get("device_id"))
+        area_id = _resolve_area_id(entity_id, entity)
         if not area_id or area_id not in areas_by_id:
             continue
         friendly_name = friendly_name_by_entity.get(entity_id)
